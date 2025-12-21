@@ -650,10 +650,10 @@ __device__ __forceinline__ mask_t makeRandomBlock(int v, int k, curandState* sta
 }
 
 __device__ __forceinline__ int rankFromLists(const int* a, int aCount, const int* b, int bCount) {
+    int elems[6];
     int ai = 0;
     int bi = 0;
-    int pos = 1;
-    int rank = 0;
+    int idx = 0;
     while (ai < aCount || bi < bCount) {
         int val;
         if (bi >= bCount || (ai < aCount && a[ai] < b[bi])) {
@@ -661,7 +661,18 @@ __device__ __forceinline__ int rankFromLists(const int* a, int aCount, const int
         } else {
             val = b[bi++];
         }
-        rank += d_binom[val][pos++];
+        elems[idx++] = val;
+    }
+
+    int rank = 0;
+    int prev = -1;
+    for (int i = 0; i < 6; i++) {
+        for (int j = prev + 1; j < elems[i]; j++) {
+            int remaining = d_v - 1 - j;
+            int choose = 5 - i;
+            rank += d_binom[remaining][choose];
+        }
+        prev = elems[i];
     }
     return rank;
 }
@@ -2419,7 +2430,6 @@ void printUsage() {
     printf("  rounds=N   Number of rounds (default: 100)\n");
     printf("  output=S   Output file for solutions (default: solution.txt)\n");
     printf("  start=S    Start from solution in file (0-based values, 0..v-1)\n");
-    printf("  swap=0/1   Move type: 1=single swap, 0=replace whole block\n");
     printf("  seed=N     Random seed (default: time)\n");
     printf("\nSimulated Annealing options (default mode):\n");
     printf("  temp=F     Initial temperature (default: 1000.0)\n");
@@ -2449,7 +2459,6 @@ int main(int argc, char* argv[]) {
     unsigned long long seed = 0;
     int seedProvided = 0;
     int useSwapMove = 1;
-    int swapProvided = 0;
     
     // RR mode parameters
     int useRR = 0;           // Record-to-Record Travel mode
@@ -2489,9 +2498,6 @@ int main(int argc, char* argv[]) {
         if (sscanf(argv[i], "seed=%llu", &seed) == 1) {
             seedProvided = 1;
         }
-        if (sscanf(argv[i], "swap=%d", &useSwapMove) == 1) {
-            swapProvided = 1;
-        }
     }
 
     if (!seedProvided) {
@@ -2530,7 +2536,7 @@ int main(int argc, char* argv[]) {
     printf("  Sample size: %d (%.2f%% of m-subsets)\n", 
            sampleSize, 100.0 * sampleSize / numMSubsets);
     printf("  Random seed: %llu\n", seed);
-    printf("  Move type: %s\n", useSwapMove ? "single swap" : "block replace");
+    printf("  Move type: single swap\n");
     printf("  Initial temp: %.1f, Cooling rate: %.4f\n", initTemp, coolRate);
     printf("  Number of rounds: %d\n", numRounds);
     printf("\n");
@@ -2822,7 +2828,6 @@ int main(int argc, char* argv[]) {
     // Load starting solution if provided
     mask_t* d_startSolution = NULL;
     mask_t* h_startSolution = NULL;
-    int useStartSolution = 0;
     
     if (strlen(startFile) > 0) {
         printf("Loading starting solution from: %s\n", startFile);
@@ -2842,17 +2847,11 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             cudaMemcpy(d_startSolution, h_startSolution, b * sizeof(mask_t), cudaMemcpyHostToDevice);
-            useStartSolution = 1;
             printf("Starting solution loaded to GPU\n");
         } else {
             printf("Failed to load starting solution, using random initialization\n");
         }
         printf("\n");
-    }
-
-    if (!swapProvided) {
-        useSwapMove = useStartSolution ? 1 : 0;
-        cudaMemcpyToSymbol(d_useSwapMove, &useSwapMove, sizeof(int));
     }
     
     // Kernel launch configuration
@@ -3082,7 +3081,7 @@ int main(int argc, char* argv[]) {
     printf("iterations    = %d\n", iterations);
     printf("sampleSize    = %d\n", sampleSize);
     printf("seed          = %llu\n", seed);
-    printf("move          = %s\n", useSwapMove ? "swap" : "block");
+    printf("move          = swap\n");
     if (useRR) {
         printf("mode          = Record-to-Record Travel\n");
         printf("threshold     = %d\n", rrThreshold);

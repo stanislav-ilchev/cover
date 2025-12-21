@@ -2887,6 +2887,7 @@ int main(int argc, char* argv[]) {
     // Main search loop
     int globalBestCost = INT_MAX;
     int bestRound = -1;
+    int stopEarly = 0;
     clock_t startTime = clock();
     
     int batchSize = 0;
@@ -3205,10 +3206,39 @@ int main(int argc, char* argv[]) {
         // Get initial cost
         cudaMemcpy(h_bestCosts, d_bestCosts, costBytes, cudaMemcpyDeviceToHost);
         int initCost = INT_MAX;
+        int initBestIdx = 0;
         for (int i = 0; i < numRuns; i++) {
-            if (h_bestCosts[i] < initCost) initCost = h_bestCosts[i];
+            if (h_bestCosts[i] < initCost) {
+                initCost = h_bestCosts[i];
+                initBestIdx = i;
+            }
         }
         printf("initCost      = %d\n\n", initCost);
+
+        if (initCost == 0) {
+            globalBestCost = 0;
+            bestRound = round;
+            cudaMemcpy(h_bestSolution,
+                       d_bestSolutions + initBestIdx * b,
+                       b * sizeof(mask_t),
+                       cudaMemcpyDeviceToHost);
+
+            printf("*** PERFECT SOLUTION AT INIT ***\n");
+            printSolution(h_bestSolution, b, k, stdout);
+
+            FILE* f = fopen(outputFile, "w");
+            if (f) {
+                fprintf(f, "# L(%d,%d,%d,%d) with b=%d blocks\n", v, k, m, t, b);
+                fprintf(f, "# Estimated uncovered: %d (sampled)\n", initCost);
+                fprintf(f, "# Round: %d\n\n", round + 1);
+                printSolution(h_bestSolution, b, k, f);
+                fclose(f);
+                printf("Solution saved to %s\n", outputFile);
+            }
+
+            stopEarly = 1;
+            break;
+        }
 
         if (useParallel && useExact) {
             if (useFastCounts) {
@@ -3365,9 +3395,11 @@ int main(int argc, char* argv[]) {
 
                 int currentBest = INT_MAX;
                 int currentCost = INT_MAX;
+                int bestIdx = 0;
                 for (int i = 0; i < numRuns; i++) {
                     if (h_bestCosts[i] < currentBest) {
                         currentBest = h_bestCosts[i];
+                        bestIdx = i;
                     }
                     if (h_costs[i] < currentCost) {
                         currentCost = h_costs[i];
@@ -3380,6 +3412,31 @@ int main(int argc, char* argv[]) {
                            totalIters, currentCost, currentBest, elapsed);
                     lastBestCost = currentBest;
                     fflush(stdout);
+
+                    if (currentBest == 0) {
+                        globalBestCost = 0;
+                        bestRound = round;
+                        cudaMemcpy(h_bestSolution,
+                                   d_bestSolutions + bestIdx * b,
+                                   b * sizeof(mask_t),
+                                   cudaMemcpyDeviceToHost);
+
+                        printf("*** PERFECT SOLUTION FOUND ***\n");
+                        printSolution(h_bestSolution, b, k, stdout);
+
+                        FILE* f = fopen(outputFile, "w");
+                        if (f) {
+                            fprintf(f, "# L(%d,%d,%d,%d) with b=%d blocks\n", v, k, m, t, b);
+                            fprintf(f, "# Estimated uncovered: %d (sampled)\n", currentBest);
+                            fprintf(f, "# Round: %d\n\n", round + 1);
+                            printSolution(h_bestSolution, b, k, f);
+                            fclose(f);
+                            printf("Solution saved to %s\n", outputFile);
+                        }
+
+                        stopEarly = 1;
+                        break;
+                    }
                 }
             } else {
                 // Get current costs and best from GPU after every batch
@@ -3388,9 +3445,11 @@ int main(int argc, char* argv[]) {
 
                 int currentBest = INT_MAX;
                 int currentCost = INT_MAX;
+                int bestIdx = 0;
                 for (int i = 0; i < numRuns; i++) {
                     if (h_bestCosts[i] < currentBest) {
                         currentBest = h_bestCosts[i];
+                        bestIdx = i;
                     }
                     if (h_costs[i] < currentCost) {
                         currentCost = h_costs[i];
@@ -3398,6 +3457,31 @@ int main(int argc, char* argv[]) {
                 }
 
                 double elapsed = (double)(clock() - roundStart) / CLOCKS_PER_SEC;
+
+                if (currentBest == 0) {
+                    globalBestCost = 0;
+                    bestRound = round;
+                    cudaMemcpy(h_bestSolution,
+                               d_bestSolutions + bestIdx * b,
+                               b * sizeof(mask_t),
+                               cudaMemcpyDeviceToHost);
+
+                    printf("*** PERFECT SOLUTION FOUND ***\n");
+                    printSolution(h_bestSolution, b, k, stdout);
+
+                    FILE* f = fopen(outputFile, "w");
+                    if (f) {
+                        fprintf(f, "# L(%d,%d,%d,%d) with b=%d blocks\n", v, k, m, t, b);
+                        fprintf(f, "# Estimated uncovered: %d (sampled)\n", currentBest);
+                        fprintf(f, "# Round: %d\n\n", round + 1);
+                        printSolution(h_bestSolution, b, k, f);
+                        fclose(f);
+                        printf("Solution saved to %s\n", outputFile);
+                    }
+
+                    stopEarly = 1;
+                    break;
+                }
 
                 // Print every iteration in parallel mode, or at intervals otherwise
                 if (useParallel && useExact) {
@@ -3431,6 +3515,7 @@ int main(int argc, char* argv[]) {
         printf("\n");
         
         if (err != cudaSuccess) break;
+        if (stopEarly) break;
         
         double roundTime = (double)(clock() - roundStart) / CLOCKS_PER_SEC;
         

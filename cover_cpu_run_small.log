@@ -1,0 +1,34 @@
+Design parameters:
+------------------
+t - (v,m,k,l) = 3 - (27,4,6,1)
+b = 86
+
+Optimization parameters:
+------------------------
+TestCount     = 1
+CoolingFactor = 0.9990
+InitTemp      = 0.600
+frozen        = 20
+RestrNeighbor = 0
+L             = 200
+EndLimit      = 0
+local         = 0
+apprexp       = 0
+OntheFly      = 0
+Pack          = 0
+log           = cover_cpu_run_small.log
+result        = cover_cpu_run_small.res
+SolX          = 0
+verbose       = 0
+MemoryLimit   = 0
+check         = 1
+
+
+Runs:
+-----
+cost          = 312
+
+Statistics:
+-----------
+bestCost      = 312
+CPU-time      = 0.05

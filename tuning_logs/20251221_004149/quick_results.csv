@@ -1,0 +1,6 @@
+"Tag","TH","Iter","Rounds","Exact","Parallel","BestCost","TimeSeconds","LogFile"
+"quick","200","200","1","0","0","-1","4.2","C:\Users\Stanislav Ilchev\Desktop\cover\tuning_logs\20251221_004149\quick_TH200_iter200_rounds1_exact0_parallel0.log"
+"quick","600","200","1","0","0","-1","4.2","C:\Users\Stanislav Ilchev\Desktop\cover\tuning_logs\20251221_004149\quick_TH600_iter200_rounds1_exact0_parallel0.log"
+"quick","1200","200","1","0","0","-1","4.1","C:\Users\Stanislav Ilchev\Desktop\cover\tuning_logs\20251221_004149\quick_TH1200_iter200_rounds1_exact0_parallel0.log"
+"quick","2000","200","1","0","0","-1","4.1","C:\Users\Stanislav Ilchev\Desktop\cover\tuning_logs\20251221_004149\quick_TH2000_iter200_rounds1_exact0_parallel0.log"
+"quick","4000","200","1","0","0","-1","4.3","C:\Users\Stanislav Ilchev\Desktop\cover\tuning_logs\20251221_004149\quick_TH4000_iter200_rounds1_exact0_parallel0.log"

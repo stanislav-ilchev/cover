@@ -230,7 +230,9 @@ __global__ void zeroCosts(int* costs, int numSolutions) {
 // This is MUCH faster than full re-evaluation!
 //=============================================================================
 
+#ifndef DELTA_THREADS
 #define DELTA_THREADS 256
+#endif
 #define DELTA_BLOCKS_PER_SOL 1024  // Maximum parallelism
 
 //=============================================================================
@@ -1507,7 +1509,7 @@ __global__ void deltaEvaluateFastCounts(mask_t* solutions,
     }
 }
 
-// Apply coverage count updates after accepted moves (fast path for v=49,k=6,m=6,t=3).
+// Apply coverage count updates after accepted moves (fast path).
 __global__ void updateCoverageCountsFast(mask_t* solutions,
                                          mask_t* oldBlocks,
                                          int* moveIndices,
@@ -1530,7 +1532,6 @@ __global__ void updateCoverageCountsFast(mask_t* solutions,
     const int v = 49;
     const int k = 6;
     const int t = 3;
-    const int vMinusK = 43;
 
     int blocksPerSol = d_blocksPerSol;
     int solIdx = blockIdx.x / blocksPerSol;
@@ -1538,176 +1539,178 @@ __global__ void updateCoverageCountsFast(mask_t* solutions,
     int tid = threadIdx.x;
 
     if (solIdx >= numSolutions) return;
-    if (!accepted[solIdx]) return;
 
-    mask_t* solution = solutions + solIdx * d_b;
-    uint8_t* counts = coverageCounts + (long long)solIdx * numMSubsets;
+    if (accepted[solIdx]) {
+        mask_t* solution = solutions + solIdx * d_b;
+        uint8_t* counts = coverageCounts + (long long)solIdx * numMSubsets;
 
-    if (tid == 0) {
-        changedIdx = moveIndices[solIdx];
-        oldBlock = oldBlocks[solIdx];
-        newBlock = solution[changedIdx];
-        getBlockElements(oldBlock, oldElems, k);
-        getBlockElements(newBlock, newElems, k);
-        int oi = 0;
-        int ni = 0;
-        for (int pos = 0; pos < v; pos++) {
-            if (!(oldBlock & (1ULL << pos))) oldOutside[oi++] = (uint8_t)pos;
-            if (!(newBlock & (1ULL << pos))) newOutside[ni++] = (uint8_t)pos;
+        if (tid == 0) {
+            changedIdx = moveIndices[solIdx];
+            oldBlock = oldBlocks[solIdx];
+            newBlock = solution[changedIdx];
+            getBlockElements(oldBlock, oldElems, k);
+            getBlockElements(newBlock, newElems, k);
+            int oi = 0;
+            int ni = 0;
+            for (int pos = 0; pos < v; pos++) {
+                if (!(oldBlock & (1ULL << pos))) oldOutside[oi++] = (uint8_t)pos;
+                if (!(newBlock & (1ULL << pos))) newOutside[ni++] = (uint8_t)pos;
+            }
+        }
+        __syncthreads();
+
+        int totalThreads = DELTA_THREADS * blocksPerSol;
+        int globalTid = blockInSol * DELTA_THREADS + tid;
+
+        // Decrement counts for subsets covered by old but not by new.
+        for (int idx = globalTid; idx < total; idx += totalThreads) {
+            int t_in, localIdx;
+            if (idx < offset1) { t_in = 3; localIdx = idx; }
+            else if (idx < offset2) { t_in = 4; localIdx = idx - offset1; }
+            else if (idx < offset3) { t_in = 5; localIdx = idx - offset2; }
+            else { t_in = 6; localIdx = idx - offset3; }
+
+            int t_out = k - t_in;
+            int c_out = (t_out == 3) ? 12341 : (t_out == 2) ? 903 : (t_out == 1) ? 43 : 1;
+            int combo_in = localIdx / c_out;
+            int combo_out = localIdx - combo_in * c_out;
+
+            int blockSel[6];
+            int outSel[6];
+            int blockCount = 0;
+            int outCount = 0;
+            int newHits = 0;
+
+            if (t_in == 3) {
+                const uint8_t* comb = d_blockComb3[combo_in];
+                for (int i = 0; i < 3; i++) {
+                    int elem = oldElems[comb[i]];
+                    blockSel[blockCount++] = elem;
+                    if (newBlock & (1ULL << elem)) newHits++;
+                }
+            } else if (t_in == 4) {
+                const uint8_t* comb = d_blockComb4[combo_in];
+                for (int i = 0; i < 4; i++) {
+                    int elem = oldElems[comb[i]];
+                    blockSel[blockCount++] = elem;
+                    if (newBlock & (1ULL << elem)) newHits++;
+                }
+            } else if (t_in == 5) {
+                const uint8_t* comb = d_blockComb5[combo_in];
+                for (int i = 0; i < 5; i++) {
+                    int elem = oldElems[comb[i]];
+                    blockSel[blockCount++] = elem;
+                    if (newBlock & (1ULL << elem)) newHits++;
+                }
+            } else {
+                const uint8_t* comb = d_blockComb6[0];
+                for (int i = 0; i < 6; i++) {
+                    int elem = oldElems[comb[i]];
+                    blockSel[blockCount++] = elem;
+                    if (newBlock & (1ULL << elem)) newHits++;
+                }
+            }
+
+            if (t_out == 3) {
+                const uint8_t* comb = d_outComb3[combo_out];
+                for (int i = 0; i < 3; i++) {
+                    int elem = oldOutside[comb[i]];
+                    outSel[outCount++] = elem;
+                    if (newBlock & (1ULL << elem)) newHits++;
+                }
+            } else if (t_out == 2) {
+                const uint8_t* comb = d_outComb2[combo_out];
+                for (int i = 0; i < 2; i++) {
+                    int elem = oldOutside[comb[i]];
+                    outSel[outCount++] = elem;
+                    if (newBlock & (1ULL << elem)) newHits++;
+                }
+            } else if (t_out == 1) {
+                int elem = oldOutside[d_outComb1[combo_out]];
+                outSel[outCount++] = elem;
+                if (newBlock & (1ULL << elem)) newHits++;
+            }
+
+            if (newHits >= t) continue;
+            int rank = rankFromLists(blockSel, blockCount, outSel, outCount);
+            counts[rank]--;
+        }
+
+        // Increment counts for subsets covered by new but not by old.
+        for (int idx = globalTid; idx < total; idx += totalThreads) {
+            int t_in, localIdx;
+            if (idx < offset1) { t_in = 3; localIdx = idx; }
+            else if (idx < offset2) { t_in = 4; localIdx = idx - offset1; }
+            else if (idx < offset3) { t_in = 5; localIdx = idx - offset2; }
+            else { t_in = 6; localIdx = idx - offset3; }
+
+            int t_out = k - t_in;
+            int c_out = (t_out == 3) ? 12341 : (t_out == 2) ? 903 : (t_out == 1) ? 43 : 1;
+            int combo_in = localIdx / c_out;
+            int combo_out = localIdx - combo_in * c_out;
+
+            int blockSel[6];
+            int outSel[6];
+            int blockCount = 0;
+            int outCount = 0;
+            int oldHits = 0;
+
+            if (t_in == 3) {
+                const uint8_t* comb = d_blockComb3[combo_in];
+                for (int i = 0; i < 3; i++) {
+                    int elem = newElems[comb[i]];
+                    blockSel[blockCount++] = elem;
+                    if (oldBlock & (1ULL << elem)) oldHits++;
+                }
+            } else if (t_in == 4) {
+                const uint8_t* comb = d_blockComb4[combo_in];
+                for (int i = 0; i < 4; i++) {
+                    int elem = newElems[comb[i]];
+                    blockSel[blockCount++] = elem;
+                    if (oldBlock & (1ULL << elem)) oldHits++;
+                }
+            } else if (t_in == 5) {
+                const uint8_t* comb = d_blockComb5[combo_in];
+                for (int i = 0; i < 5; i++) {
+                    int elem = newElems[comb[i]];
+                    blockSel[blockCount++] = elem;
+                    if (oldBlock & (1ULL << elem)) oldHits++;
+                }
+            } else {
+                const uint8_t* comb = d_blockComb6[0];
+                for (int i = 0; i < 6; i++) {
+                    int elem = newElems[comb[i]];
+                    blockSel[blockCount++] = elem;
+                    if (oldBlock & (1ULL << elem)) oldHits++;
+                }
+            }
+
+            if (t_out == 3) {
+                const uint8_t* comb = d_outComb3[combo_out];
+                for (int i = 0; i < 3; i++) {
+                    int elem = newOutside[comb[i]];
+                    outSel[outCount++] = elem;
+                    if (oldBlock & (1ULL << elem)) oldHits++;
+                }
+            } else if (t_out == 2) {
+                const uint8_t* comb = d_outComb2[combo_out];
+                for (int i = 0; i < 2; i++) {
+                    int elem = newOutside[comb[i]];
+                    outSel[outCount++] = elem;
+                    if (oldBlock & (1ULL << elem)) oldHits++;
+                }
+            } else if (t_out == 1) {
+                int elem = newOutside[d_outComb1[combo_out]];
+                outSel[outCount++] = elem;
+                if (oldBlock & (1ULL << elem)) oldHits++;
+            }
+
+            if (oldHits >= t) continue;
+            int rank = rankFromLists(blockSel, blockCount, outSel, outCount);
+            counts[rank]++;
         }
     }
-    __syncthreads();
 
-    int totalThreads = DELTA_THREADS * blocksPerSol;
-    int globalTid = blockInSol * DELTA_THREADS + tid;
-
-    // Decrement counts for subsets covered by old but not by new.
-    for (int idx = globalTid; idx < total; idx += totalThreads) {
-        int t_in, localIdx;
-        if (idx < offset1) { t_in = 3; localIdx = idx; }
-        else if (idx < offset2) { t_in = 4; localIdx = idx - offset1; }
-        else if (idx < offset3) { t_in = 5; localIdx = idx - offset2; }
-        else { t_in = 6; localIdx = idx - offset3; }
-
-        int t_out = k - t_in;
-        int c_out = (t_out == 3) ? 12341 : (t_out == 2) ? 903 : (t_out == 1) ? 43 : 1;
-        int combo_in = localIdx / c_out;
-        int combo_out = localIdx - combo_in * c_out;
-
-        int blockSel[6];
-        int outSel[6];
-        int blockCount = 0;
-        int outCount = 0;
-        int newHits = 0;
-
-        if (t_in == 3) {
-            const uint8_t* comb = d_blockComb3[combo_in];
-            for (int i = 0; i < 3; i++) {
-                int elem = oldElems[comb[i]];
-                blockSel[blockCount++] = elem;
-                if (newBlock & (1ULL << elem)) newHits++;
-            }
-        } else if (t_in == 4) {
-            const uint8_t* comb = d_blockComb4[combo_in];
-            for (int i = 0; i < 4; i++) {
-                int elem = oldElems[comb[i]];
-                blockSel[blockCount++] = elem;
-                if (newBlock & (1ULL << elem)) newHits++;
-            }
-        } else if (t_in == 5) {
-            const uint8_t* comb = d_blockComb5[combo_in];
-            for (int i = 0; i < 5; i++) {
-                int elem = oldElems[comb[i]];
-                blockSel[blockCount++] = elem;
-                if (newBlock & (1ULL << elem)) newHits++;
-            }
-        } else {
-            const uint8_t* comb = d_blockComb6[0];
-            for (int i = 0; i < 6; i++) {
-                int elem = oldElems[comb[i]];
-                blockSel[blockCount++] = elem;
-                if (newBlock & (1ULL << elem)) newHits++;
-            }
-        }
-
-        if (t_out == 3) {
-            const uint8_t* comb = d_outComb3[combo_out];
-            for (int i = 0; i < 3; i++) {
-                int elem = oldOutside[comb[i]];
-                outSel[outCount++] = elem;
-                if (newBlock & (1ULL << elem)) newHits++;
-            }
-        } else if (t_out == 2) {
-            const uint8_t* comb = d_outComb2[combo_out];
-            for (int i = 0; i < 2; i++) {
-                int elem = oldOutside[comb[i]];
-                outSel[outCount++] = elem;
-                if (newBlock & (1ULL << elem)) newHits++;
-            }
-        } else if (t_out == 1) {
-            int elem = oldOutside[d_outComb1[combo_out]];
-            outSel[outCount++] = elem;
-            if (newBlock & (1ULL << elem)) newHits++;
-        }
-
-        if (newHits >= t) continue;
-        int rank = rankFromLists(blockSel, blockCount, outSel, outCount);
-        counts[rank]--;
-    }
-
-    // Increment counts for subsets covered by new but not by old.
-    for (int idx = globalTid; idx < total; idx += totalThreads) {
-        int t_in, localIdx;
-        if (idx < offset1) { t_in = 3; localIdx = idx; }
-        else if (idx < offset2) { t_in = 4; localIdx = idx - offset1; }
-        else if (idx < offset3) { t_in = 5; localIdx = idx - offset2; }
-        else { t_in = 6; localIdx = idx - offset3; }
-
-        int t_out = k - t_in;
-        int c_out = (t_out == 3) ? 12341 : (t_out == 2) ? 903 : (t_out == 1) ? 43 : 1;
-        int combo_in = localIdx / c_out;
-        int combo_out = localIdx - combo_in * c_out;
-
-        int blockSel[6];
-        int outSel[6];
-        int blockCount = 0;
-        int outCount = 0;
-        int oldHits = 0;
-
-        if (t_in == 3) {
-            const uint8_t* comb = d_blockComb3[combo_in];
-            for (int i = 0; i < 3; i++) {
-                int elem = newElems[comb[i]];
-                blockSel[blockCount++] = elem;
-                if (oldBlock & (1ULL << elem)) oldHits++;
-            }
-        } else if (t_in == 4) {
-            const uint8_t* comb = d_blockComb4[combo_in];
-            for (int i = 0; i < 4; i++) {
-                int elem = newElems[comb[i]];
-                blockSel[blockCount++] = elem;
-                if (oldBlock & (1ULL << elem)) oldHits++;
-            }
-        } else if (t_in == 5) {
-            const uint8_t* comb = d_blockComb5[combo_in];
-            for (int i = 0; i < 5; i++) {
-                int elem = newElems[comb[i]];
-                blockSel[blockCount++] = elem;
-                if (oldBlock & (1ULL << elem)) oldHits++;
-            }
-        } else {
-            const uint8_t* comb = d_blockComb6[0];
-            for (int i = 0; i < 6; i++) {
-                int elem = newElems[comb[i]];
-                blockSel[blockCount++] = elem;
-                if (oldBlock & (1ULL << elem)) oldHits++;
-            }
-        }
-
-        if (t_out == 3) {
-            const uint8_t* comb = d_outComb3[combo_out];
-            for (int i = 0; i < 3; i++) {
-                int elem = newOutside[comb[i]];
-                outSel[outCount++] = elem;
-                if (oldBlock & (1ULL << elem)) oldHits++;
-            }
-        } else if (t_out == 2) {
-            const uint8_t* comb = d_outComb2[combo_out];
-            for (int i = 0; i < 2; i++) {
-                int elem = newOutside[comb[i]];
-                outSel[outCount++] = elem;
-                if (oldBlock & (1ULL << elem)) oldHits++;
-            }
-        } else if (t_out == 1) {
-            int elem = newOutside[d_outComb1[combo_out]];
-            outSel[outCount++] = elem;
-            if (oldBlock & (1ULL << elem)) oldHits++;
-        }
-
-        if (oldHits >= t) continue;
-        int rank = rankFromLists(blockSel, blockCount, outSel, outCount);
-        counts[rank]++;
-    }
 }
 
 // Correct delta evaluation - properly handles coverage changes
@@ -2778,6 +2781,7 @@ int main(int argc, char* argv[]) {
     uint8_t* d_coverageCounts = NULL;  // Coverage count per m-subset per solution
     int* d_accepted = NULL;  // Track which solutions accepted the move
     
+    
     if (useParallel) {
         printf("[CUDA]   Allocating parallel mode arrays...\n");
         err = cudaMalloc(&d_oldBlocks, numRuns * sizeof(mask_t));
@@ -2816,6 +2820,12 @@ int main(int argc, char* argv[]) {
 
     if (useFastDelta && useParallel && useExact && d_coverageCounts != NULL) {
         useFastCounts = 1;
+    }
+
+    if (useFastCounts) {
+        if (d_accepted) {
+            cudaMemset(d_accepted, 0, numRuns * sizeof(int));
+        }
     }
     
     printf("[CUDA] Device memory allocated successfully\n\n");
@@ -2896,112 +2906,133 @@ int main(int argc, char* argv[]) {
     int fastCountsBatch = 1;
     float tunedMsPerIter = 0.0f;
     float fusedMsPerIter = 0.0f;
+    cudaStream_t computeStream = NULL;
+    cudaGraph_t iterGraph = NULL;
+    cudaGraphExec_t iterGraphExec = NULL;
+    int graphBatch = 0;
+    int useGraph = 0;
+    int tunedFastCounts = 0;
+    int blocksOverride = 0;
+    const char* blocksEnv = getenv("COVER_BLOCKS_PER_SOL");
+    if (blocksEnv && *blocksEnv) {
+        blocksOverride = atoi(blocksEnv);
+    }
 
     if (useFastCounts) {
-        printf("[CUDA] Tuning fast counts kernels...\n");
-        fflush(stdout);
+        if (blocksOverride > 0) {
+            if (blocksOverride < 1) blocksOverride = 1;
+            if (blocksOverride > DELTA_BLOCKS_PER_SOL) blocksOverride = DELTA_BLOCKS_PER_SOL;
+            blocksPerSol = blocksOverride;
+            cudaMemcpyToSymbol(d_blocksPerSol, &blocksPerSol, sizeof(int));
+            printf("[CUDA] Using COVER_BLOCKS_PER_SOL=%d (tuning disabled)\n", blocksPerSol);
+        } else {
+            printf("[CUDA] Tuning fast counts kernels...\n");
+            fflush(stdout);
 
-        initSolutionsOnly<<<blocks, threadsPerBlock>>>(
-            d_solutions, d_startSolution, d_randStates, numRuns);
-        cudaDeviceSynchronize();
+            initSolutionsOnly<<<blocks, threadsPerBlock>>>(
+                d_solutions, d_startSolution, d_randStates, numRuns);
+            cudaDeviceSynchronize();
 
-        err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            printf("ERROR in initSolutionsOnly (tuning): %s\n", cudaGetErrorString(err));
-            return 1;
-        }
-
-        initCoverageCounts<<<numRuns, EVAL_THREADS>>>(
-            d_solutions, d_mSubsetMasks, d_coverageCounts,
-            d_costs, numRuns, (int)numMSubsets);
-        cudaDeviceSynchronize();
-
-        err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            printf("ERROR in initCoverageCounts (tuning): %s\n", cudaGetErrorString(err));
-            return 1;
-        }
-
-        cudaMemcpy(d_bestCosts, d_costs, costBytes, cudaMemcpyDeviceToDevice);
-        cudaMemcpy(d_bestSolutions, d_solutions, solnBytes, cudaMemcpyDeviceToDevice);
-
-        int candidates[] = {64, 128, 256, 512, 1024};
-        int candidateCount = (int)(sizeof(candidates) / sizeof(candidates[0]));
-        float bestMs = 1.0e30f;
-        int bestBlocks = blocksPerSol;
-        int tuneIters = 10;
-
-        for (int ci = 0; ci < candidateCount; ci++) {
-            int candidate = candidates[ci];
-            if (candidate < 1 || candidate > DELTA_BLOCKS_PER_SOL) continue;
-
-            cudaMemcpyToSymbol(d_blocksPerSol, &candidate, sizeof(int));
-
-            cudaEvent_t startEvent;
-            cudaEvent_t stopEvent;
-            err = cudaEventCreate(&startEvent);
+            err = cudaGetLastError();
             if (err != cudaSuccess) {
-                printf("[CUDA] WARNING: cudaEventCreate failed during tuning: %s\n",
-                       cudaGetErrorString(err));
-                break;
-            }
-            err = cudaEventCreate(&stopEvent);
-            if (err != cudaSuccess) {
-                printf("[CUDA] WARNING: cudaEventCreate failed during tuning: %s\n",
-                       cudaGetErrorString(err));
-                cudaEventDestroy(startEvent);
-                break;
+                printf("ERROR in initSolutionsOnly (tuning): %s\n", cudaGetErrorString(err));
+                return 1;
             }
 
-            cudaEventRecord(startEvent, 0);
-            for (int iter = 0; iter < tuneIters; iter++) {
-                makeMoves<<<blocks, threadsPerBlock>>>(
-                    d_solutions, d_oldBlocks, d_moveIndices,
-                    d_randStates, numRuns);
+            initCoverageCounts<<<numRuns, EVAL_THREADS>>>(
+                d_solutions, d_mSubsetMasks, d_coverageCounts,
+                d_costs, numRuns, (int)numMSubsets);
+            cudaDeviceSynchronize();
+
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                printf("ERROR in initCoverageCounts (tuning): %s\n", cudaGetErrorString(err));
+                return 1;
+            }
+
+            cudaMemcpy(d_bestCosts, d_costs, costBytes, cudaMemcpyDeviceToDevice);
+            cudaMemcpy(d_bestSolutions, d_solutions, solnBytes, cudaMemcpyDeviceToDevice);
+
+            int candidates[] = {64, 128, 256, 512, 1024};
+            int candidateCount = (int)(sizeof(candidates) / sizeof(candidates[0]));
+            float bestMs = 1.0e30f;
+            int bestBlocks = blocksPerSol;
+            int tuneIters = 10;
+
+            for (int ci = 0; ci < candidateCount; ci++) {
+                int candidate = candidates[ci];
+                if (candidate < 1 || candidate > DELTA_BLOCKS_PER_SOL) continue;
+
+                cudaMemcpyToSymbol(d_blocksPerSol, &candidate, sizeof(int));
+
+                cudaEvent_t startEvent;
+                cudaEvent_t stopEvent;
+                err = cudaEventCreate(&startEvent);
+                if (err != cudaSuccess) {
+                    printf("[CUDA] WARNING: cudaEventCreate failed during tuning: %s\n",
+                           cudaGetErrorString(err));
+                    break;
+                }
+                err = cudaEventCreate(&stopEvent);
+                if (err != cudaSuccess) {
+                    printf("[CUDA] WARNING: cudaEventCreate failed during tuning: %s\n",
+                           cudaGetErrorString(err));
+                    cudaEventDestroy(startEvent);
+                    break;
+                }
 
                 cudaMemset(d_deltaCosts, 0, numRuns * sizeof(int));
 
-                deltaEvaluateFastCounts<<<numRuns * candidate, DELTA_THREADS>>>(
-                    d_solutions, d_oldBlocks, d_moveIndices, d_coverageCounts,
-                    d_deltaCosts, numRuns, (int)numMSubsets);
+                cudaEventRecord(startEvent, 0);
+                for (int iter = 0; iter < tuneIters; iter++) {
+                    makeMoves<<<blocks, threadsPerBlock>>>(
+                        d_solutions, d_oldBlocks, d_moveIndices,
+                        d_randStates, numRuns);
 
-                acceptRejectWithCoverage<<<blocks, threadsPerBlock>>>(
-                    d_solutions, d_bestSolutions, d_oldBlocks, d_moveIndices,
-                    d_costs, d_bestCosts, d_deltaCosts, d_accepted,
-                    rrThreshold, numRuns);
+                    deltaEvaluateFastCounts<<<numRuns * candidate, DELTA_THREADS>>>(
+                        d_solutions, d_oldBlocks, d_moveIndices, d_coverageCounts,
+                        d_deltaCosts, numRuns, (int)numMSubsets);
 
-                updateCoverageCountsFast<<<numRuns * candidate, DELTA_THREADS>>>(
-                    d_solutions, d_oldBlocks, d_moveIndices, d_accepted,
-                    d_coverageCounts, numRuns, (int)numMSubsets);
-            }
-            cudaEventRecord(stopEvent, 0);
-            err = cudaEventSynchronize(stopEvent);
-            if (err != cudaSuccess) {
-                printf("[CUDA] WARNING: cudaEventSynchronize failed during tuning: %s\n",
-                       cudaGetErrorString(err));
-            }
+                    acceptRejectWithCoverage<<<blocks, threadsPerBlock>>>(
+                        d_solutions, d_bestSolutions, d_oldBlocks, d_moveIndices,
+                        d_costs, d_bestCosts, d_deltaCosts,
+                        d_accepted, rrThreshold, numRuns);
 
-            float ms = 0.0f;
-            cudaEventElapsedTime(&ms, startEvent, stopEvent);
-            cudaEventDestroy(startEvent);
-            cudaEventDestroy(stopEvent);
+                    updateCoverageCountsFast<<<numRuns * candidate, DELTA_THREADS>>>(
+                        d_solutions, d_oldBlocks, d_moveIndices,
+                        d_accepted,
+                        d_coverageCounts, numRuns, (int)numMSubsets);
+                }
+                cudaEventRecord(stopEvent, 0);
+                err = cudaEventSynchronize(stopEvent);
+                if (err != cudaSuccess) {
+                    printf("[CUDA] WARNING: cudaEventSynchronize failed during tuning: %s\n",
+                           cudaGetErrorString(err));
+                }
 
-            if (ms > 0.0f) {
-                float perIter = ms / tuneIters;
-                if (perIter < bestMs) {
-                    bestMs = perIter;
-                    bestBlocks = candidate;
+                float ms = 0.0f;
+                cudaEventElapsedTime(&ms, startEvent, stopEvent);
+                cudaEventDestroy(startEvent);
+                cudaEventDestroy(stopEvent);
+
+                if (ms > 0.0f) {
+                    float perIter = ms / tuneIters;
+                    if (perIter < bestMs) {
+                        bestMs = perIter;
+                        bestBlocks = candidate;
+                    }
                 }
             }
-        }
 
-        blocksPerSol = bestBlocks;
-        cudaMemcpyToSymbol(d_blocksPerSol, &blocksPerSol, sizeof(int));
-        tunedMsPerIter = (bestMs < 1.0e29f) ? bestMs : 0.0f;
-        if (tunedMsPerIter > 0.0f) {
-            printf("[CUDA] Tuned blocksPerSol = %d (%.3f ms/iter)\n", blocksPerSol, tunedMsPerIter);
-        } else {
-            printf("[CUDA] Tuned blocksPerSol = %d\n", blocksPerSol);
+            blocksPerSol = bestBlocks;
+            cudaMemcpyToSymbol(d_blocksPerSol, &blocksPerSol, sizeof(int));
+            tunedMsPerIter = (bestMs < 1.0e29f) ? bestMs : 0.0f;
+            if (tunedMsPerIter > 0.0f) {
+                printf("[CUDA] Tuned blocksPerSol = %d (%.3f ms/iter)\n", blocksPerSol, tunedMsPerIter);
+            } else {
+                printf("[CUDA] Tuned blocksPerSol = %d\n", blocksPerSol);
+            }
+            tunedFastCounts = 1;
         }
 
         if (numRuns == 1 && useRR) {
@@ -3036,7 +3067,7 @@ int main(int argc, char* argv[]) {
 
                 if (ms > 0.0f) {
                     fusedMsPerIter = ms / tuneFusedIters;
-                    if (fusedMsPerIter < tunedMsPerIter || tunedMsPerIter == 0.0f) {
+                    if (tunedFastCounts && fusedMsPerIter < tunedMsPerIter) {
                         useFusedSingle = 1;
                         printf("[CUDA] Fused single-run kernel enabled (%.3f ms/iter)\n",
                                fusedMsPerIter);
@@ -3114,6 +3145,80 @@ int main(int argc, char* argv[]) {
     }
     printf("rounds        = %d\n\n", numRounds);
     fflush(stdout);
+
+    if (useParallel && useExact && useFastCounts && !useFusedSingle) {
+        const char* graphEnv = getenv("COVER_GRAPH_BATCH");
+        int graphOverride = -1;
+        if (graphEnv && *graphEnv) {
+            graphOverride = atoi(graphEnv);
+        }
+
+        if (graphOverride == 0) {
+            graphBatch = 0;
+        } else if (graphOverride > 0) {
+            graphBatch = graphOverride;
+        } else {
+            graphBatch = fastCountsBatch;
+        }
+
+        if (graphBatch > iterations) graphBatch = iterations;
+        if (graphBatch < 2) graphBatch = 0;
+
+        if (graphBatch > 0) {
+            err = cudaStreamCreateWithFlags(&computeStream, cudaStreamNonBlocking);
+            if (err != cudaSuccess) {
+                printf("[CUDA] WARNING: Failed to create compute stream: %s\n", cudaGetErrorString(err));
+                computeStream = NULL;
+                graphBatch = 0;
+            }
+        }
+
+        if (graphBatch > 0 && computeStream != NULL) {
+            err = cudaStreamBeginCapture(computeStream, cudaStreamCaptureModeGlobal);
+            if (err == cudaSuccess) {
+                for (int gi = 0; gi < graphBatch; gi++) {
+                    makeMoves<<<blocks, threadsPerBlock, 0, computeStream>>>(
+                        d_solutions, d_oldBlocks, d_moveIndices,
+                        d_randStates, numRuns);
+
+                    deltaEvaluateFastCounts<<<numRuns * blocksPerSol, DELTA_THREADS, 0, computeStream>>>(
+                        d_solutions, d_oldBlocks, d_moveIndices, d_coverageCounts,
+                        d_deltaCosts, numRuns, (int)numMSubsets);
+
+                    acceptRejectWithCoverage<<<blocks, threadsPerBlock, 0, computeStream>>>(
+                        d_solutions, d_bestSolutions, d_oldBlocks, d_moveIndices,
+                        d_costs, d_bestCosts, d_deltaCosts,
+                        d_accepted, rrThreshold, numRuns);
+
+                    updateCoverageCountsFast<<<numRuns * blocksPerSol, DELTA_THREADS, 0, computeStream>>>(
+                        d_solutions, d_oldBlocks, d_moveIndices,
+                        d_accepted,
+                        d_coverageCounts, numRuns, (int)numMSubsets);
+                }
+                err = cudaStreamEndCapture(computeStream, &iterGraph);
+            }
+
+            if (err == cudaSuccess) {
+                err = cudaGraphInstantiate(&iterGraphExec, iterGraph, NULL, NULL, 0);
+            }
+
+            if (err == cudaSuccess) {
+                useGraph = 1;
+                printf("[CUDA] Graph batch enabled: %d iters/launch\n", graphBatch);
+            } else {
+                printf("[CUDA] WARNING: Graph capture failed: %s\n", cudaGetErrorString(err));
+                if (iterGraphExec) {
+                    cudaGraphExecDestroy(iterGraphExec);
+                    iterGraphExec = NULL;
+                }
+                if (iterGraph) {
+                    cudaGraphDestroy(iterGraph);
+                    iterGraph = NULL;
+                }
+                graphBatch = 0;
+            }
+        }
+    }
     
     for (int round = 0; round < numRounds; round++) {
         printf("Round %d/%d\n", round + 1, numRounds);
@@ -3240,6 +3345,15 @@ int main(int argc, char* argv[]) {
             break;
         }
 
+        if (useParallel && useExact && useFastCounts && !useFusedSingle) {
+            cudaStream_t workStream = computeStream ? computeStream : 0;
+            cudaMemsetAsync(d_deltaCosts, 0, numRuns * sizeof(int), workStream);
+            if (d_accepted) {
+                cudaMemsetAsync(d_accepted, 0, numRuns * sizeof(int), workStream);
+            }
+            cudaStreamSynchronize(workStream);
+        }
+
         if (useParallel && useExact) {
             if (useFastCounts) {
                 batchSize = useFusedSingle ? fusedBatch : fastCountsBatch;
@@ -3281,32 +3395,72 @@ int main(int argc, char* argv[]) {
                             d_randStates, rrThreshold, itersThis);
                         cudaDeviceSynchronize();
                     } else {
-                        for (int iter = 0; iter < itersThis; iter++) {
-                            // 1. Make random moves
-                            makeMoves<<<blocks, threadsPerBlock>>>(
-                                d_solutions, d_oldBlocks, d_moveIndices,
-                                d_randStates, numRuns);
+                        cudaStream_t workStream = computeStream ? computeStream : 0;
+                        err = cudaSuccess;
 
-                            // 2. Zero delta costs
-                            cudaMemset(d_deltaCosts, 0, numRuns * sizeof(int));
+                        if (useGraph && iterGraphExec != NULL && graphBatch > 0) {
+                            int graphRuns = itersThis / graphBatch;
+                            int remainder = itersThis - graphRuns * graphBatch;
 
-                            // 3. Exact delta evaluate using coverage counts
-                            deltaEvaluateFastCounts<<<numRuns * blocksPerSol, DELTA_THREADS>>>(
-                                d_solutions, d_oldBlocks, d_moveIndices, d_coverageCounts,
-                                d_deltaCosts, numRuns, (int)numMSubsets);
+                            for (int gi = 0; gi < graphRuns; gi++) {
+                                err = cudaGraphLaunch(iterGraphExec, workStream);
+                                if (err != cudaSuccess) break;
+                            }
 
-                            // 4. Apply deltas and capture accept decisions
-                            acceptRejectWithCoverage<<<blocks, threadsPerBlock>>>(
-                                d_solutions, d_bestSolutions, d_oldBlocks, d_moveIndices,
-                                d_costs, d_bestCosts, d_deltaCosts, d_accepted,
-                                rrThreshold, numRuns);
+                            if (err == cudaSuccess && remainder > 0) {
+                                for (int iter = 0; iter < remainder; iter++) {
+                                    // Exact delta evaluate using coverage counts
+                                    makeMoves<<<blocks, threadsPerBlock, 0, workStream>>>(
+                                        d_solutions, d_oldBlocks, d_moveIndices,
+                                        d_randStates, numRuns);
 
-                            // 5. Update coverage counts for accepted moves
-                            updateCoverageCountsFast<<<numRuns * blocksPerSol, DELTA_THREADS>>>(
-                                d_solutions, d_oldBlocks, d_moveIndices, d_accepted,
-                                d_coverageCounts, numRuns, (int)numMSubsets);
+                                    deltaEvaluateFastCounts<<<numRuns * blocksPerSol, DELTA_THREADS, 0, workStream>>>(
+                                        d_solutions, d_oldBlocks, d_moveIndices, d_coverageCounts,
+                                        d_deltaCosts, numRuns, (int)numMSubsets);
+
+                                    acceptRejectWithCoverage<<<blocks, threadsPerBlock, 0, workStream>>>(
+                                        d_solutions, d_bestSolutions, d_oldBlocks, d_moveIndices,
+                                        d_costs, d_bestCosts, d_deltaCosts,
+                                        d_accepted, rrThreshold, numRuns);
+
+                                    // Apply deltas, update coverage counts, and propose next move
+                                    updateCoverageCountsFast<<<numRuns * blocksPerSol, DELTA_THREADS, 0, workStream>>>(
+                                        d_solutions, d_oldBlocks, d_moveIndices,
+                                        d_accepted,
+                                        d_coverageCounts, numRuns, (int)numMSubsets);
+                                }
+                            }
+                        } else {
+                            for (int iter = 0; iter < itersThis; iter++) {
+                                // Exact delta evaluate using coverage counts
+                                makeMoves<<<blocks, threadsPerBlock, 0, workStream>>>(
+                                    d_solutions, d_oldBlocks, d_moveIndices,
+                                    d_randStates, numRuns);
+
+                                deltaEvaluateFastCounts<<<numRuns * blocksPerSol, DELTA_THREADS, 0, workStream>>>(
+                                    d_solutions, d_oldBlocks, d_moveIndices, d_coverageCounts,
+                                    d_deltaCosts, numRuns, (int)numMSubsets);
+
+                                acceptRejectWithCoverage<<<blocks, threadsPerBlock, 0, workStream>>>(
+                                    d_solutions, d_bestSolutions, d_oldBlocks, d_moveIndices,
+                                    d_costs, d_bestCosts, d_deltaCosts,
+                                    d_accepted, rrThreshold, numRuns);
+
+                                // Apply deltas, update coverage counts, and propose next move
+                                updateCoverageCountsFast<<<numRuns * blocksPerSol, DELTA_THREADS, 0, workStream>>>(
+                                    d_solutions, d_oldBlocks, d_moveIndices,
+                                    d_accepted,
+                                    d_coverageCounts, numRuns, (int)numMSubsets);
+                            }
                         }
-                        cudaDeviceSynchronize();
+
+                        if (err == cudaSuccess) {
+                            err = cudaStreamSynchronize(workStream);
+                        }
+                        if (err != cudaSuccess) {
+                            printf("[CUDA] ERROR (fast counts batch): %s\n", cudaGetErrorString(err));
+                            break;
+                        }
                     }
                 } else {
                     for (int iter = 0; iter < itersThis; iter++) {
@@ -3565,6 +3719,10 @@ int main(int argc, char* argv[]) {
     }
     
     // Cleanup
+    if (iterGraphExec) cudaGraphExecDestroy(iterGraphExec);
+    if (iterGraph) cudaGraphDestroy(iterGraph);
+    if (computeStream) cudaStreamDestroy(computeStream);
+
     cudaFree(d_solutions);
     cudaFree(d_bestSolutions);
     cudaFree(d_costs);

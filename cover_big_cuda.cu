@@ -3265,23 +3265,7 @@ int main(int argc, char* argv[]) {
     fflush(stdout);
         
         int totalIters = 0;
-        int lastBestCost = useFastCounts ? initCost : INT_MAX;
-        int printInterval = (useParallel && useExact && !useFastCounts) ? 1 : (batchesPerRound / 20);
-        if (printInterval < 1) printInterval = 1;
-
-        if (useFastCounts) {
-            cudaMemcpy(h_costs, d_costs, costBytes, cudaMemcpyDeviceToHost);
-            int currentCost = INT_MAX;
-            for (int i = 0; i < numRuns; i++) {
-                if (h_costs[i] < currentCost) {
-                    currentCost = h_costs[i];
-                }
-            }
-            double elapsed = (double)(clock() - roundStart) / CLOCKS_PER_SEC;
-            printf("    %6d    %6d    %6d   %6.1fs\n",
-                   totalIters, currentCost, initCost, elapsed);
-            fflush(stdout);
-        }
+        int lastBestCost = initCost;
         
         for (int batch = 0; batch < batchesPerRound; batch++) {
             int itersThis = batchSize;
@@ -3483,31 +3467,11 @@ int main(int argc, char* argv[]) {
                     break;
                 }
 
-                // Print every iteration in parallel mode, or at intervals otherwise
-                if (useParallel && useExact) {
-                    // Always print in parallel mode
-                    if (currentBest < lastBestCost) {
-                        printf("    %6d    %6d    %6d   %6.1fs  *\n",
-                               totalIters, currentCost, currentBest, elapsed);
-                        lastBestCost = currentBest;
-                    } else {
-                        printf("    %6d    %6d    %6d   %6.1fs\n",
-                               totalIters, currentCost, currentBest, elapsed);
-                    }
+                if (currentBest < lastBestCost) {
+                    printf("    %6d    %6d    %6d   %6.1fs  *\n",
+                           totalIters, currentCost, currentBest, elapsed);
+                    lastBestCost = currentBest;
                     fflush(stdout);
-                } else {
-                    // Print on improvement or at intervals
-                    if (currentBest < lastBestCost) {
-                        printf("    %6d    %6d    %6d   %6.1fs  *\n",
-                               totalIters, currentCost, currentBest, elapsed);
-                        lastBestCost = currentBest;
-                        fflush(stdout);
-                    }
-                    else if ((batch + 1) % printInterval == 0 || batch == batchesPerRound - 1) {
-                        printf("    %6d    %6d    %6d   %6.1fs\n",
-                               totalIters, currentCost, currentBest, elapsed);
-                        fflush(stdout);
-                    }
                 }
             }
         }

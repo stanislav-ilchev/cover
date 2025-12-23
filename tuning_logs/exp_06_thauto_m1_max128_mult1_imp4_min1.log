@@ -1,0 +1,169 @@
+=== CUDA Big Covering Design Solver ===
+Problem: L(49,6,6,3) with b=163 blocks
+M-subsets to cover: 13983816
+Possible blocks: 13983816
+
+Settings:
+  Parallel runs: 1
+  Iterations per run: 200000
+  Sample size: 10000 (0.07% of m-subsets)
+  Random seed: 1
+  Move type: single swap
+  Initial temp: 1000.0, Cooling rate: 0.9990
+  Number of rounds: 1
+
+[CUDA] Checking for CUDA devices...
+[CUDA] Found 1 CUDA device(s)
+[CUDA] Selecting device 0...
+[CUDA] GPU Name: NVIDIA GeForce RTX 3060 Laptop GPU
+[CUDA] GPU Memory: 6.0 GB
+[CUDA] SM Count: 30
+[CUDA] Max threads per block: 1024
+[CUDA] Warp size: 32
+[CUDA] Compute capability: 8.6
+
+[CUDA] Warming up GPU...
+[CUDA] GPU ready
+
+[CUDA] Copying constants to device...
+[CUDA] Constants copied successfully
+[CUDA] Exact mode enabled
+[CUDA]   Generating 13983816 m-subset masks (106.69 MB)...
+[CUDA]   M-subset masks generated
+[CUDA]   M-subset masks copied to GPU
+
+[CUDA] Memory requirements:
+[CUDA]   Solutions: 0.00 MB x 2
+[CUDA]   Costs: 0.00 KB x 2
+[CUDA]   Random states: 0.00 MB
+[CUDA]   Total: 0.00 MB
+
+[CUDA] Allocating device memory...
+[CUDA]   Allocating d_solutions (0.00 MB)...
+[CUDA]   Allocating d_bestSolutions (0.00 MB)...
+[CUDA]   Allocating d_costs...
+[CUDA]   Allocating d_bestCosts...
+[CUDA]   Allocating d_randStates (0.00 MB)...
+[CUDA]   Allocating d_temperatures...
+[CUDA]   Allocating parallel mode arrays...
+[CUDA]   Allocating coverage counts (13.3 MB)...
+[CUDA] Device memory allocated successfully
+
+Kernel config: 1 blocks x 128 threads = 128 total threads
+
+[CUDA] Initializing 1 random states...
+[CUDA] Launching initRandStates kernel: <<<1, 128>>>
+[CUDA] Kernel launched, waiting for completion...
+[CUDA] Random states initialized successfully
+
+[CUDA] Tuning fast counts kernels...
+[CUDA] Tuned blocksPerSol = 1024 (0.166 ms/iter)
+
+
+Parameters:
+-----------
+v             = 49
+k             = 6
+m             = 6
+t             = 3
+b             = 163
+parallelRuns  = 1
+iterations    = 200000
+sampleSize    = 10000
+seed          = 1
+move          = swap
+mode          = Record-to-Record Travel
+threshold     = 0 (adaptive)
+thStallIters  = 42054 (1x neighborhood)
+thMax         = 128
+thMode        = 1
+thMin         = 1
+thImprove     = 4
+costMode      = delta (counts)
+deltaThreads  = 262144 per solution (256 threads x 1024 blocks)
+totalThreads  = 262144 (for 1 solutions)
+fastDelta     = enabled (v=49,k=6,m=6,t=3)
+fastCounts    = enabled (coverage counts)
+fastBatch     = 3017 iters/batch
+rounds        = 1
+
+[CUDA] Graph batch disabled (adaptive RR threshold)
+Round 1/1
+---------
+Initializing solutions...
+Initializing coverage counts (fast counts)...
+Initialization complete.
+
+initCost      = 651669
+
+Starting Record-to-Record Travel (threshold=1, adaptive)...
+
+      iter      cost      best     time
+    ----------------------------------------
+      3017    166440    166440      1.1s  TH=1 *
+      6034    139660    139660      1.6s  TH=1 *
+      9051    125993    125993      2.0s  TH=1 *
+     12068    120844    120844      2.4s  TH=1 *
+     15085    114427    114427      2.9s  TH=1 *
+     18102    109634    109634      3.3s  TH=1 *
+     21119    106912    106912      3.8s  TH=1 *
+     24136    104724    104724      4.2s  TH=1 *
+     27153    103277    103277      4.6s  TH=1 *
+     30170    101846    101846      5.1s  TH=1 *
+     33187    100579    100579      5.5s  TH=1 *
+     36204    100228    100228      6.0s  TH=1 *
+     39221     99252     99252      6.4s  TH=1 *
+     42238     98273     98273      6.8s  TH=1 *
+     45255     97788     97788      7.3s  TH=1 *
+     48272     97233     97233      7.7s  TH=1 *
+     51289     96937     96937      8.1s  TH=1 *
+     54306     96692     96692      8.6s  TH=1 *
+     57323     96313     96313      9.0s  TH=1 *
+     60340     96096     96096      9.5s  TH=1 *
+     63357     95783     95783      9.9s  TH=1 *
+     66374     95104     95104     10.3s  TH=1 *
+     69391     94737     94737     10.8s  TH=1 *
+     72408     94640     94640     11.2s  TH=1 *
+     78442     94538     94538     12.1s  TH=1 *
+     81459     94231     94231     12.5s  TH=1 *
+     84476     93845     93845     13.0s  TH=1 *
+     87493     93637     93637     13.4s  TH=1 *
+     90510     93542     93542     13.8s  TH=1 *
+     93527     92845     92845     14.3s  TH=1 *
+     99561     92518     92518     15.2s  TH=1 *
+    102578     92357     92357     15.6s  TH=1 *
+    105595     92134     92134     16.0s  TH=1 *
+    108612     92061     92061     16.5s  TH=1 *
+    114646     91957     91957     17.3s  TH=1 *
+    117663     91370     91370     17.8s  TH=1 *
+    129731     91333     91333     19.5s  TH=1 *
+    132748     90995     90995     20.0s  TH=1 *
+    144816     90909     90909     21.7s  TH=1 *
+    150850     90719     90719     22.6s  TH=1 *
+    156884     90696     90696     23.5s  TH=1 *
+    165935     90622     90622     24.8s  TH=1 *
+    178003     90597     90597     26.6s  TH=1 *
+    181020     90445     90445     27.0s  TH=1 *
+    184037     90380     90380     27.4s  TH=1 *
+    190071     89984     89984     28.3s  TH=1 *
+    199122     89979     89979     29.6s  TH=1 *
+
+Round 1 completed: cost = 89979, best = 89979, time = 29.77s
+Iterations: 200000 x 1 runs = 200000 total
+
+*** NEW BEST: cost = 89979 ***
+
+Solution saved to tuning_logs\sol_exp_06.txt
+
+Total elapsed: 30.4 seconds, Global best: 89979 (round 1)
+Estimated evaluations: 200000
+
+
+Statistics:
+-----------
+bestCost      = 89979
+bestRound     = 1
+totalTime     = 30.44 seconds
+totalRuns     = 1
+totalIters    = 200000
+resultFile    = tuning_logs\sol_exp_06.txt

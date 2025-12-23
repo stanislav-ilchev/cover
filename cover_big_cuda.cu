@@ -1841,27 +1841,98 @@ __global__ void applyDeltaRR(mask_t* solutions,
     deltaCosts[idx] = 0;
 }
 
+// Device: Quick heuristic to estimate coverage improvement from a swap
+// Returns a score: higher = better for coverage (heuristic based on element frequency)
+__device__ int estimateCoverageScore(mask_t oldBlock, mask_t newBlock, int v) {
+    // Simple heuristic: prefer swaps that add elements that appear in fewer blocks
+    // For now, just return a random score - the real cleverness is trying multiple swaps
+    // This is a placeholder - in practice, we'd track element frequencies
+    return 0;  // Neutral score
+}
+
 // Kernel: Make random moves on all solutions (one thread per solution)
+// When cost=0, uses greedy selection: tries multiple swaps and picks best one
 __global__ void makeMoves(mask_t* solutions,
                            mask_t* oldBlocks,      // Store old block for potential revert
                            int* moveIndices,       // Store which block was changed
                            curandState* randStates,
-                           int numSolutions) {
+                           int* costs,             // Check if cost=0 for greedy mode
+                           int numSolutions,
+                           int greedyTrials) {     // Number of swaps to try when cost=0 (0 = disabled)
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= numSolutions) return;
     
     curandState localState = randStates[idx];
     mask_t* solution = solutions + idx * d_b;
     
-    // Pick random block to change
-    int blkIdx = curand(&localState) % d_b;
-    moveIndices[idx] = blkIdx;
-    oldBlocks[idx] = solution[blkIdx];
-    
-    mask_t newBlock = d_useSwapMove
-        ? makeSingleSwap(oldBlocks[idx], d_v, d_k, &localState)
-        : makeRandomBlock(d_v, d_k, &localState);
-    solution[blkIdx] = newBlock;
+    // Greedy mode: when cost=0, try multiple swaps and pick the best
+    if (costs && costs[idx] == 0 && greedyTrials > 0 && d_useSwapMove) {
+        int bestBlockIdx = -1;
+        mask_t bestOldBlock = 0;
+        mask_t bestNewBlock = 0;
+        int bestScore = INT_MIN;
+        
+        // Try multiple swaps
+        for (int trial = 0; trial < greedyTrials; trial++) {
+            int blkIdx = curand(&localState) % d_b;
+            mask_t oldBlock = solution[blkIdx];
+            mask_t newBlock = makeSingleSwap(oldBlock, d_v, d_k, &localState);
+            
+            // Heuristic: prefer swaps that add "rare" elements
+            // For now, use a simple diversity metric: prefer swaps that increase block diversity
+            int score = 0;
+            
+            // Check if new block is different from old (should always be true)
+            if (newBlock != oldBlock) {
+                // Prefer swaps that add elements not already in many blocks
+                // Simple heuristic: count how many blocks already have the added element
+                mask_t added = newBlock & ~oldBlock;
+                mask_t removed = oldBlock & ~newBlock;
+                
+                int addedCount = 0;
+                int removedCount = 0;
+                for (int i = 0; i < d_b; i++) {
+                    if (i != blkIdx) {
+                        if (solution[i] & added) addedCount++;
+                        if (solution[i] & removed) removedCount++;
+                    }
+                }
+                
+                // Prefer adding rare elements (low count) and removing common ones (high count)
+                score = removedCount - addedCount;  // Higher is better
+            }
+            
+            if (score > bestScore) {
+                bestScore = score;
+                bestBlockIdx = blkIdx;
+                bestOldBlock = oldBlock;
+                bestNewBlock = newBlock;
+            }
+        }
+        
+        // Apply best move
+        if (bestBlockIdx >= 0) {
+            moveIndices[idx] = bestBlockIdx;
+            oldBlocks[idx] = bestOldBlock;
+            solution[bestBlockIdx] = bestNewBlock;
+        } else {
+            // Fallback to random
+            int blkIdx = curand(&localState) % d_b;
+            moveIndices[idx] = blkIdx;
+            oldBlocks[idx] = solution[blkIdx];
+            solution[blkIdx] = makeSingleSwap(solution[blkIdx], d_v, d_k, &localState);
+        }
+    } else {
+        // Normal random move
+        int blkIdx = curand(&localState) % d_b;
+        moveIndices[idx] = blkIdx;
+        oldBlocks[idx] = solution[blkIdx];
+        
+        mask_t newBlock = d_useSwapMove
+            ? makeSingleSwap(oldBlocks[idx], d_v, d_k, &localState)
+            : makeRandomBlock(d_v, d_k, &localState);
+        solution[blkIdx] = newBlock;
+    }
     
     randStates[idx] = localState;
 }
@@ -2987,7 +3058,7 @@ int main(int argc, char* argv[]) {
                 for (int iter = 0; iter < tuneIters; iter++) {
                     makeMoves<<<blocks, threadsPerBlock>>>(
                         d_solutions, d_oldBlocks, d_moveIndices,
-                        d_randStates, numRuns);
+                        d_randStates, d_costs, numRuns, greedyTrials);
 
                     deltaEvaluateFastCounts<<<numRuns * candidate, DELTA_THREADS>>>(
                         d_solutions, d_oldBlocks, d_moveIndices, d_coverageCounts,
@@ -3179,7 +3250,7 @@ int main(int argc, char* argv[]) {
                 for (int gi = 0; gi < graphBatch; gi++) {
                     makeMoves<<<blocks, threadsPerBlock, 0, computeStream>>>(
                         d_solutions, d_oldBlocks, d_moveIndices,
-                        d_randStates, numRuns);
+                        d_randStates, d_costs, numRuns, greedyTrials);
 
                     deltaEvaluateFastCounts<<<numRuns * blocksPerSol, DELTA_THREADS, 0, computeStream>>>(
                         d_solutions, d_oldBlocks, d_moveIndices, d_coverageCounts,
@@ -3412,7 +3483,7 @@ int main(int argc, char* argv[]) {
                                     // Exact delta evaluate using coverage counts
                                     makeMoves<<<blocks, threadsPerBlock, 0, workStream>>>(
                                         d_solutions, d_oldBlocks, d_moveIndices,
-                                        d_randStates, numRuns);
+                                        d_randStates, d_costs, numRuns, greedyTrials);
 
                                     deltaEvaluateFastCounts<<<numRuns * blocksPerSol, DELTA_THREADS, 0, workStream>>>(
                                         d_solutions, d_oldBlocks, d_moveIndices, d_coverageCounts,
@@ -3435,7 +3506,7 @@ int main(int argc, char* argv[]) {
                                 // Exact delta evaluate using coverage counts
                                 makeMoves<<<blocks, threadsPerBlock, 0, workStream>>>(
                                     d_solutions, d_oldBlocks, d_moveIndices,
-                                    d_randStates, numRuns);
+                                    d_randStates, d_costs, numRuns, greedyTrials);
 
                                 deltaEvaluateFastCounts<<<numRuns * blocksPerSol, DELTA_THREADS, 0, workStream>>>(
                                     d_solutions, d_oldBlocks, d_moveIndices, d_coverageCounts,
@@ -3478,7 +3549,7 @@ int main(int argc, char* argv[]) {
                         // 1. Make random moves
                         makeMoves<<<blocks, threadsPerBlock>>>(
                             d_solutions, d_oldBlocks, d_moveIndices,
-                            d_randStates, numRuns);
+                            d_randStates, d_costs, numRuns, greedyTrials);
                         cudaDeviceSynchronize();
                         
                         // 2. Zero delta costs

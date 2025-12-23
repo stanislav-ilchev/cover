@@ -323,12 +323,12 @@ static int selectNthBit(maskType mask, int n)
 #if defined(__GNUC__) || defined(__clang__)
   return __builtin_ctzll(mask);
 #else
-  {
-    int i;
+{
+  int i;
     for(i = 0; i < 64; i++)
       if(mask & ((maskType) 1 << i))
 	return i;
-    return -1;
+  return -1;
   }
 #endif
 }

@@ -1292,6 +1292,410 @@ __global__ void singleRunFastRRKernel(mask_t* solutions,
     }
 }
 
+// Fused RR kernel for multiple solutions (v=49,k=6,m=6,t=3 only).
+// One block per solution, multiple iterations per launch.
+__global__ void multiRunFastRRKernel(mask_t* solutions,
+                                      mask_t* bestSolutions,
+                                      int* costs,
+                                      int* bestCosts,
+                                      uint8_t* coverageCounts,
+                                      curandState* randStates,
+                                      int threshold,
+                                      int itersPerKernel,
+                                      int numSolutions,
+                                      int numMSubsets) {
+    int solIdx = blockIdx.x;
+    if (solIdx >= numSolutions) return;
+
+    __shared__ int sharedDelta[DELTA_THREADS];
+    __shared__ mask_t oldBlock;
+    __shared__ mask_t newBlock;
+    __shared__ int changedIdx;
+    __shared__ int oldElems[MAX_K];
+    __shared__ int newElems[MAX_K];
+    __shared__ uint8_t oldOutside[43];
+    __shared__ uint8_t newOutside[43];
+    __shared__ int sharedAccept;
+    __shared__ int sharedImproved;
+
+    const int total = 260624;
+    const int offset1 = 246820;
+    const int offset2 = 260365;
+    const int offset3 = 260623;
+    const int v = 49;
+    const int k = 6;
+    const int t = 3;
+
+    int tid = threadIdx.x;
+    mask_t* solution = solutions + solIdx * d_b;
+    mask_t* best = bestSolutions + solIdx * d_b;
+    uint8_t* counts = coverageCounts + (long long)solIdx * numMSubsets;
+
+    curandState localState;
+    int currentCost = 0;
+    int bestCost = 0;
+
+    if (tid == 0) {
+        localState = randStates[solIdx];
+        currentCost = costs[solIdx];
+        bestCost = bestCosts[solIdx];
+    }
+    __syncthreads();
+
+    for (int iter = 0; iter < itersPerKernel; iter++) {
+        if (tid == 0) {
+            makeMove(solution, d_b, d_v, d_k, &localState, &changedIdx, &oldBlock, &newBlock);
+            getBlockElements(oldBlock, oldElems, k);
+            getBlockElements(newBlock, newElems, k);
+            int oi = 0;
+            int ni = 0;
+            for (int pos = 0; pos < v; pos++) {
+                if (!(oldBlock & (1ULL << pos))) oldOutside[oi++] = (uint8_t)pos;
+                if (!(newBlock & (1ULL << pos))) newOutside[ni++] = (uint8_t)pos;
+            }
+        }
+        __syncthreads();
+
+        int myDelta = 0;
+
+        // OLD block: subsets covered by old but not by new.
+        for (int idx = tid; idx < total; idx += blockDim.x) {
+            int t_in, localIdx;
+            if (idx < offset1) { t_in = 3; localIdx = idx; }
+            else if (idx < offset2) { t_in = 4; localIdx = idx - offset1; }
+            else if (idx < offset3) { t_in = 5; localIdx = idx - offset2; }
+            else { t_in = 6; localIdx = idx - offset3; }
+
+            int t_out = k - t_in;
+            int c_out = (t_out == 3) ? 12341 : (t_out == 2) ? 903 : (t_out == 1) ? 43 : 1;
+            int combo_in = localIdx / c_out;
+            int combo_out = localIdx - combo_in * c_out;
+
+            int blockSel[6];
+            int outSel[6];
+            int blockCount = 0;
+            int outCount = 0;
+            int newHits = 0;
+
+            if (t_in == 3) {
+                const uint8_t* comb = d_blockComb3[combo_in];
+                for (int i = 0; i < 3; i++) {
+                    int elem = oldElems[comb[i]];
+                    blockSel[blockCount++] = elem;
+                    if (newBlock & (1ULL << elem)) newHits++;
+                }
+            } else if (t_in == 4) {
+                const uint8_t* comb = d_blockComb4[combo_in];
+                for (int i = 0; i < 4; i++) {
+                    int elem = oldElems[comb[i]];
+                    blockSel[blockCount++] = elem;
+                    if (newBlock & (1ULL << elem)) newHits++;
+                }
+            } else if (t_in == 5) {
+                const uint8_t* comb = d_blockComb5[combo_in];
+                for (int i = 0; i < 5; i++) {
+                    int elem = oldElems[comb[i]];
+                    blockSel[blockCount++] = elem;
+                    if (newBlock & (1ULL << elem)) newHits++;
+                }
+            } else {
+                const uint8_t* comb = d_blockComb6[0];
+                for (int i = 0; i < 6; i++) {
+                    int elem = oldElems[comb[i]];
+                    blockSel[blockCount++] = elem;
+                    if (newBlock & (1ULL << elem)) newHits++;
+                }
+            }
+
+            if (t_out == 3) {
+                const uint8_t* comb = d_outComb3[combo_out];
+                for (int i = 0; i < 3; i++) {
+                    int elem = oldOutside[comb[i]];
+                    outSel[outCount++] = elem;
+                    if (newBlock & (1ULL << elem)) newHits++;
+                }
+            } else if (t_out == 2) {
+                const uint8_t* comb = d_outComb2[combo_out];
+                for (int i = 0; i < 2; i++) {
+                    int elem = oldOutside[comb[i]];
+                    outSel[outCount++] = elem;
+                    if (newBlock & (1ULL << elem)) newHits++;
+                }
+            } else if (t_out == 1) {
+                int elem = oldOutside[d_outComb1[combo_out]];
+                outSel[outCount++] = elem;
+                if (newBlock & (1ULL << elem)) newHits++;
+            }
+
+            if (newHits >= t) continue;
+            int rank = rankFromLists(blockSel, blockCount, outSel, outCount);
+            if (counts[rank] == 1) myDelta++;
+        }
+
+        // NEW block: subsets covered by new but not by old.
+        for (int idx = tid; idx < total; idx += blockDim.x) {
+            int t_in, localIdx;
+            if (idx < offset1) { t_in = 3; localIdx = idx; }
+            else if (idx < offset2) { t_in = 4; localIdx = idx - offset1; }
+            else if (idx < offset3) { t_in = 5; localIdx = idx - offset2; }
+            else { t_in = 6; localIdx = idx - offset3; }
+
+            int t_out = k - t_in;
+            int c_out = (t_out == 3) ? 12341 : (t_out == 2) ? 903 : (t_out == 1) ? 43 : 1;
+            int combo_in = localIdx / c_out;
+            int combo_out = localIdx - combo_in * c_out;
+
+            int blockSel[6];
+            int outSel[6];
+            int blockCount = 0;
+            int outCount = 0;
+            int oldHits = 0;
+
+            if (t_in == 3) {
+                const uint8_t* comb = d_blockComb3[combo_in];
+                for (int i = 0; i < 3; i++) {
+                    int elem = newElems[comb[i]];
+                    blockSel[blockCount++] = elem;
+                    if (oldBlock & (1ULL << elem)) oldHits++;
+                }
+            } else if (t_in == 4) {
+                const uint8_t* comb = d_blockComb4[combo_in];
+                for (int i = 0; i < 4; i++) {
+                    int elem = newElems[comb[i]];
+                    blockSel[blockCount++] = elem;
+                    if (oldBlock & (1ULL << elem)) oldHits++;
+                }
+            } else if (t_in == 5) {
+                const uint8_t* comb = d_blockComb5[combo_in];
+                for (int i = 0; i < 5; i++) {
+                    int elem = newElems[comb[i]];
+                    blockSel[blockCount++] = elem;
+                    if (oldBlock & (1ULL << elem)) oldHits++;
+                }
+            } else {
+                const uint8_t* comb = d_blockComb6[0];
+                for (int i = 0; i < 6; i++) {
+                    int elem = newElems[comb[i]];
+                    blockSel[blockCount++] = elem;
+                    if (oldBlock & (1ULL << elem)) oldHits++;
+                }
+            }
+
+            if (t_out == 3) {
+                const uint8_t* comb = d_outComb3[combo_out];
+                for (int i = 0; i < 3; i++) {
+                    int elem = newOutside[comb[i]];
+                    outSel[outCount++] = elem;
+                    if (oldBlock & (1ULL << elem)) oldHits++;
+                }
+            } else if (t_out == 2) {
+                const uint8_t* comb = d_outComb2[combo_out];
+                for (int i = 0; i < 2; i++) {
+                    int elem = newOutside[comb[i]];
+                    outSel[outCount++] = elem;
+                    if (oldBlock & (1ULL << elem)) oldHits++;
+                }
+            } else if (t_out == 1) {
+                int elem = newOutside[d_outComb1[combo_out]];
+                outSel[outCount++] = elem;
+                if (oldBlock & (1ULL << elem)) oldHits++;
+            }
+
+            if (oldHits >= t) continue;
+            int rank = rankFromLists(blockSel, blockCount, outSel, outCount);
+            if (counts[rank] == 0) myDelta--;
+        }
+
+        sharedDelta[tid] = myDelta;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) sharedDelta[tid] += sharedDelta[tid + stride];
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            int delta = sharedDelta[0];
+            int newCost = currentCost + delta;
+            int acceptLimit = bestCost + threshold;
+            if (newCost <= acceptLimit) {
+                currentCost = newCost;
+                sharedAccept = 1;
+                sharedImproved = (newCost < bestCost);
+                if (sharedImproved) bestCost = newCost;
+            } else {
+                solution[changedIdx] = oldBlock;
+                sharedAccept = 0;
+                sharedImproved = 0;
+            }
+        }
+        __syncthreads();
+
+        if (sharedAccept) {
+            // Decrement counts for subsets covered by old but not by new.
+            for (int idx = tid; idx < total; idx += blockDim.x) {
+                int t_in, localIdx;
+                if (idx < offset1) { t_in = 3; localIdx = idx; }
+                else if (idx < offset2) { t_in = 4; localIdx = idx - offset1; }
+                else if (idx < offset3) { t_in = 5; localIdx = idx - offset2; }
+                else { t_in = 6; localIdx = idx - offset3; }
+
+                int t_out = k - t_in;
+                int c_out = (t_out == 3) ? 12341 : (t_out == 2) ? 903 : (t_out == 1) ? 43 : 1;
+                int combo_in = localIdx / c_out;
+                int combo_out = localIdx - combo_in * c_out;
+
+                int blockSel[6];
+                int outSel[6];
+                int blockCount = 0;
+                int outCount = 0;
+                int newHits = 0;
+
+                if (t_in == 3) {
+                    const uint8_t* comb = d_blockComb3[combo_in];
+                    for (int i = 0; i < 3; i++) {
+                        int elem = oldElems[comb[i]];
+                        blockSel[blockCount++] = elem;
+                        if (newBlock & (1ULL << elem)) newHits++;
+                    }
+                } else if (t_in == 4) {
+                    const uint8_t* comb = d_blockComb4[combo_in];
+                    for (int i = 0; i < 4; i++) {
+                        int elem = oldElems[comb[i]];
+                        blockSel[blockCount++] = elem;
+                        if (newBlock & (1ULL << elem)) newHits++;
+                    }
+                } else if (t_in == 5) {
+                    const uint8_t* comb = d_blockComb5[combo_in];
+                    for (int i = 0; i < 5; i++) {
+                        int elem = oldElems[comb[i]];
+                        blockSel[blockCount++] = elem;
+                        if (newBlock & (1ULL << elem)) newHits++;
+                    }
+                } else {
+                    const uint8_t* comb = d_blockComb6[0];
+                    for (int i = 0; i < 6; i++) {
+                        int elem = oldElems[comb[i]];
+                        blockSel[blockCount++] = elem;
+                        if (newBlock & (1ULL << elem)) newHits++;
+                    }
+                }
+
+                if (t_out == 3) {
+                    const uint8_t* comb = d_outComb3[combo_out];
+                    for (int i = 0; i < 3; i++) {
+                        int elem = oldOutside[comb[i]];
+                        outSel[outCount++] = elem;
+                        if (newBlock & (1ULL << elem)) newHits++;
+                    }
+                } else if (t_out == 2) {
+                    const uint8_t* comb = d_outComb2[combo_out];
+                    for (int i = 0; i < 2; i++) {
+                        int elem = oldOutside[comb[i]];
+                        outSel[outCount++] = elem;
+                        if (newBlock & (1ULL << elem)) newHits++;
+                    }
+                } else if (t_out == 1) {
+                    int elem = oldOutside[d_outComb1[combo_out]];
+                    outSel[outCount++] = elem;
+                    if (newBlock & (1ULL << elem)) newHits++;
+                }
+
+                if (newHits >= t) continue;
+                int rank = rankFromLists(blockSel, blockCount, outSel, outCount);
+                counts[rank]--;
+            }
+
+            // Increment counts for subsets covered by new but not by old.
+            for (int idx = tid; idx < total; idx += blockDim.x) {
+                int t_in, localIdx;
+                if (idx < offset1) { t_in = 3; localIdx = idx; }
+                else if (idx < offset2) { t_in = 4; localIdx = idx - offset1; }
+                else if (idx < offset3) { t_in = 5; localIdx = idx - offset2; }
+                else { t_in = 6; localIdx = idx - offset3; }
+
+                int t_out = k - t_in;
+                int c_out = (t_out == 3) ? 12341 : (t_out == 2) ? 903 : (t_out == 1) ? 43 : 1;
+                int combo_in = localIdx / c_out;
+                int combo_out = localIdx - combo_in * c_out;
+
+                int blockSel[6];
+                int outSel[6];
+                int blockCount = 0;
+                int outCount = 0;
+                int oldHits = 0;
+
+                if (t_in == 3) {
+                    const uint8_t* comb = d_blockComb3[combo_in];
+                    for (int i = 0; i < 3; i++) {
+                        int elem = newElems[comb[i]];
+                        blockSel[blockCount++] = elem;
+                        if (oldBlock & (1ULL << elem)) oldHits++;
+                    }
+                } else if (t_in == 4) {
+                    const uint8_t* comb = d_blockComb4[combo_in];
+                    for (int i = 0; i < 4; i++) {
+                        int elem = newElems[comb[i]];
+                        blockSel[blockCount++] = elem;
+                        if (oldBlock & (1ULL << elem)) oldHits++;
+                    }
+                } else if (t_in == 5) {
+                    const uint8_t* comb = d_blockComb5[combo_in];
+                    for (int i = 0; i < 5; i++) {
+                        int elem = newElems[comb[i]];
+                        blockSel[blockCount++] = elem;
+                        if (oldBlock & (1ULL << elem)) oldHits++;
+                    }
+                } else {
+                    const uint8_t* comb = d_blockComb6[0];
+                    for (int i = 0; i < 6; i++) {
+                        int elem = newElems[comb[i]];
+                        blockSel[blockCount++] = elem;
+                        if (oldBlock & (1ULL << elem)) oldHits++;
+                    }
+                }
+
+                if (t_out == 3) {
+                    const uint8_t* comb = d_outComb3[combo_out];
+                    for (int i = 0; i < 3; i++) {
+                        int elem = newOutside[comb[i]];
+                        outSel[outCount++] = elem;
+                        if (oldBlock & (1ULL << elem)) oldHits++;
+                    }
+                } else if (t_out == 2) {
+                    const uint8_t* comb = d_outComb2[combo_out];
+                    for (int i = 0; i < 2; i++) {
+                        int elem = newOutside[comb[i]];
+                        outSel[outCount++] = elem;
+                        if (oldBlock & (1ULL << elem)) oldHits++;
+                    }
+                } else if (t_out == 1) {
+                    int elem = newOutside[d_outComb1[combo_out]];
+                    outSel[outCount++] = elem;
+                    if (oldBlock & (1ULL << elem)) oldHits++;
+                }
+
+                if (oldHits >= t) continue;
+                int rank = rankFromLists(blockSel, blockCount, outSel, outCount);
+                counts[rank]++;
+            }
+        }
+
+        __syncthreads();
+        if (sharedAccept && sharedImproved && tid == 0) {
+            for (int i = 0; i < d_b; i++) {
+                best[i] = solution[i];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        costs[solIdx] = currentCost;
+        bestCosts[solIdx] = bestCost;
+        randStates[solIdx] = localState;
+    }
+}
+
 // Delta evaluation using coverage counts (fast path for v=49,k=6,m=6,t=3).
 __global__ void deltaEvaluateFastCounts(mask_t* solutions,
                                          mask_t* oldBlocks,
@@ -2550,6 +2954,7 @@ int main(int argc, char* argv[]) {
     int useFastDelta = 0;    // Specialized delta kernel for v=49,k=6,m=6,t=3
     int useFastCounts = 0;
     int useFusedSingle = 0;
+    int useFusedMulti = 0;
     int blocksPerSol = DELTA_BLOCKS_PER_SOL;
     
     // Parse arguments
@@ -2980,9 +3385,11 @@ int main(int argc, char* argv[]) {
     int batchSize = 0;
     int batchesPerRound = 0;
     int fusedBatch = 1000;
+    int fusedMultiBatch = 1000;
     int fastCountsBatch = 1;
     float tunedMsPerIter = 0.0f;
     float fusedMsPerIter = 0.0f;
+    float fusedMultiMsPerIter = 0.0f;
     cudaStream_t computeStream = NULL;
     cudaGraph_t iterGraph = NULL;
     cudaGraphExec_t iterGraphExec = NULL;
@@ -3156,6 +3563,50 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        if (numRuns > 1 && useRR) {
+            int tuneFusedIters = 50;
+            cudaEvent_t startEvent;
+            cudaEvent_t stopEvent;
+            err = cudaEventCreate(&startEvent);
+            if (err == cudaSuccess) {
+                err = cudaEventCreate(&stopEvent);
+            }
+            if (err != cudaSuccess) {
+                printf("[CUDA] WARNING: cudaEventCreate failed for fused multi tuning: %s\n",
+                       cudaGetErrorString(err));
+                if (err == cudaSuccess) {
+                    cudaEventDestroy(startEvent);
+                }
+            } else {
+                cudaEventRecord(startEvent, 0);
+                multiRunFastRRKernel<<<numRuns, DELTA_THREADS>>>(
+                    d_solutions, d_bestSolutions, d_costs, d_bestCosts, d_coverageCounts,
+                    d_randStates, rrThreshold, tuneFusedIters, numRuns, (int)numMSubsets);
+                cudaEventRecord(stopEvent, 0);
+                err = cudaEventSynchronize(stopEvent);
+                if (err != cudaSuccess) {
+                    printf("[CUDA] WARNING: cudaEventSynchronize failed for fused multi tuning: %s\n",
+                           cudaGetErrorString(err));
+                }
+                float ms = 0.0f;
+                cudaEventElapsedTime(&ms, startEvent, stopEvent);
+                cudaEventDestroy(startEvent);
+                cudaEventDestroy(stopEvent);
+
+                if (ms > 0.0f) {
+                    fusedMultiMsPerIter = ms / tuneFusedIters;
+                    if (tunedFastCounts && fusedMultiMsPerIter < tunedMsPerIter) {
+                        useFusedMulti = 1;
+                        printf("[CUDA] Fused multi-run kernel enabled (%.3f ms/iter)\n",
+                               fusedMultiMsPerIter);
+                    } else {
+                        printf("[CUDA] Fused multi-run kernel not selected (%.3f ms/iter)\n",
+                               fusedMultiMsPerIter);
+                    }
+                }
+            }
+        }
+
         if (useFusedSingle && fusedMsPerIter > 0.0f) {
             float maxKernelMs = prop.kernelExecTimeoutEnabled ? 1000.0f : 5000.0f;
             int tunedBatch = (int)(maxKernelMs / fusedMsPerIter);
@@ -3164,7 +3615,15 @@ int main(int argc, char* argv[]) {
             fusedBatch = tunedBatch;
         }
 
-        if (!useFusedSingle) {
+        if (useFusedMulti && fusedMultiMsPerIter > 0.0f) {
+            float maxKernelMs = prop.kernelExecTimeoutEnabled ? 1000.0f : 5000.0f;
+            int tunedBatch = (int)(maxKernelMs / fusedMultiMsPerIter);
+            if (tunedBatch < 1) tunedBatch = 1;
+            if (tunedBatch > 20000) tunedBatch = 20000;
+            fusedMultiBatch = tunedBatch;
+        }
+
+        if (!useFusedSingle && !useFusedMulti) {
             float maxBatchMs = prop.kernelExecTimeoutEnabled ? 500.0f : 2000.0f;
             if (tunedMsPerIter > 0.0f) {
                 int tunedBatch = (int)(maxBatchMs / tunedMsPerIter);
@@ -3215,6 +3674,9 @@ int main(int argc, char* argv[]) {
             if (useFusedSingle) {
                 printf("fusedSingle   = enabled (single-run RR)\n");
                 printf("fusedBatch    = %d iters/launch\n", fusedBatch);
+            } else if (useFusedMulti) {
+                printf("fusedMulti    = enabled (multi-run RR)\n");
+                printf("fusedBatch    = %d iters/launch\n", fusedMultiBatch);
             } else if (fastCountsBatch > 1) {
                 printf("fastBatch     = %d iters/batch\n", fastCountsBatch);
             }
@@ -3223,7 +3685,7 @@ int main(int argc, char* argv[]) {
     printf("rounds        = %d\n\n", numRounds);
     fflush(stdout);
 
-    if (useParallel && useExact && useFastCounts && !useFusedSingle) {
+    if (useParallel && useExact && useFastCounts && !useFusedSingle && !useFusedMulti) {
         const char* graphEnv = getenv("COVER_GRAPH_BATCH");
         int graphOverride = -1;
         if (graphEnv && *graphEnv) {
@@ -3433,7 +3895,13 @@ int main(int argc, char* argv[]) {
 
         if (useParallel && useExact) {
             if (useFastCounts) {
-                batchSize = useFusedSingle ? fusedBatch : fastCountsBatch;
+                if (useFusedSingle) {
+                    batchSize = fusedBatch;
+                } else if (useFusedMulti) {
+                    batchSize = fusedMultiBatch;
+                } else {
+                    batchSize = fastCountsBatch;
+                }
             } else {
                 batchSize = 1;
             }
@@ -3471,6 +3939,11 @@ int main(int argc, char* argv[]) {
                         singleRunFastRRKernel<<<1, DELTA_THREADS>>>(
                             d_solutions, d_bestSolutions, d_costs, d_bestCosts, d_coverageCounts,
                             d_randStates, rrThreshold, itersThis);
+                        cudaDeviceSynchronize();
+                    } else if (useFusedMulti) {
+                        multiRunFastRRKernel<<<numRuns, DELTA_THREADS>>>(
+                            d_solutions, d_bestSolutions, d_costs, d_bestCosts, d_coverageCounts,
+                            d_randStates, rrThreshold, itersThis, numRuns, (int)numMSubsets);
                         cudaDeviceSynchronize();
                     } else {
                         cudaStream_t workStream = computeStream ? computeStream : 0;

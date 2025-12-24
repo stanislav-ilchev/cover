@@ -2551,6 +2551,7 @@ int main(int argc, char* argv[]) {
     int useFastCounts = 0;
     int useFusedSingle = 0;
     int blocksPerSol = DELTA_BLOCKS_PER_SOL;
+    int greedyTrials = 0;    // When cost=0 try multiple swaps per move (0=off)
     
     // Parse arguments
     for (int i = 1; i < argc; i++) {
@@ -2575,6 +2576,7 @@ int main(int argc, char* argv[]) {
         sscanf(argv[i], "TH=%d", &rrThreshold);
         sscanf(argv[i], "exact=%d", &useExact);
         sscanf(argv[i], "parallel=%d", &useParallel);
+        sscanf(argv[i], "greedyTrials=%d", &greedyTrials);
         if (sscanf(argv[i], "seed=%llu", &seed) == 1) {
             seedProvided = 1;
         }
@@ -2619,6 +2621,7 @@ int main(int argc, char* argv[]) {
     printf("  Move type: single swap\n");
     printf("  Initial temp: %.1f, Cooling rate: %.4f\n", initTemp, coolRate);
     printf("  Number of rounds: %d\n", numRounds);
+    printf("  Greedy trials: %d (0=disabled)\n", greedyTrials);
     printf("\n");
     
     // Check CUDA device

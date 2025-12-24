@@ -28,6 +28,12 @@
 
 typedef uint64_t mask_t;
 
+typedef struct {
+    uint8_t t_in;
+    uint8_t combo_in;
+    uint16_t combo_out;
+} ComboIndex;
+
 // Device constants
 __constant__ int d_v, d_k, d_m, d_t, d_b;
 __constant__ int d_numKSubsets;
@@ -46,6 +52,7 @@ __constant__ uint8_t d_outComb1[43];
 
 // Global pointer to precomputed m-subset masks (for exact mode)
 __device__ mask_t* d_mSubsetMasksPtr = NULL;
+__device__ ComboIndex* d_comboLookup = NULL;
 
 // Device: count bits in mask
 __device__ __forceinline__ int popcount64(mask_t x) {
@@ -916,9 +923,6 @@ __global__ void singleRunFastRRKernel(mask_t* solutions,
     __shared__ int sharedImproved;
 
     const int total = 260624;
-    const int offset1 = 246820;
-    const int offset2 = 260365;
-    const int offset3 = 260623;
     const int v = 49;
     const int k = 6;
     const int t = 3;
@@ -956,16 +960,11 @@ __global__ void singleRunFastRRKernel(mask_t* solutions,
 
         // OLD block: subsets covered by old but not by new.
         for (int idx = tid; idx < total; idx += blockDim.x) {
-            int t_in, localIdx;
-            if (idx < offset1) { t_in = 3; localIdx = idx; }
-            else if (idx < offset2) { t_in = 4; localIdx = idx - offset1; }
-            else if (idx < offset3) { t_in = 5; localIdx = idx - offset2; }
-            else { t_in = 6; localIdx = idx - offset3; }
-
+            ComboIndex combo = d_comboLookup[idx];
+            int t_in = combo.t_in;
             int t_out = k - t_in;
-            int c_out = (t_out == 3) ? 12341 : (t_out == 2) ? 903 : (t_out == 1) ? 43 : 1;
-            int combo_in = localIdx / c_out;
-            int combo_out = localIdx - combo_in * c_out;
+            int combo_in = combo.combo_in;
+            int combo_out = combo.combo_out;
 
             int blockSel[6];
             int outSel[6];
@@ -1030,16 +1029,11 @@ __global__ void singleRunFastRRKernel(mask_t* solutions,
 
         // NEW block: subsets covered by new but not by old.
         for (int idx = tid; idx < total; idx += blockDim.x) {
-            int t_in, localIdx;
-            if (idx < offset1) { t_in = 3; localIdx = idx; }
-            else if (idx < offset2) { t_in = 4; localIdx = idx - offset1; }
-            else if (idx < offset3) { t_in = 5; localIdx = idx - offset2; }
-            else { t_in = 6; localIdx = idx - offset3; }
-
+            ComboIndex combo = d_comboLookup[idx];
+            int t_in = combo.t_in;
             int t_out = k - t_in;
-            int c_out = (t_out == 3) ? 12341 : (t_out == 2) ? 903 : (t_out == 1) ? 43 : 1;
-            int combo_in = localIdx / c_out;
-            int combo_out = localIdx - combo_in * c_out;
+            int combo_in = combo.combo_in;
+            int combo_out = combo.combo_out;
 
             int blockSel[6];
             int outSel[6];
@@ -1129,16 +1123,11 @@ __global__ void singleRunFastRRKernel(mask_t* solutions,
         if (sharedAccept) {
             // Decrement counts for subsets covered by old but not by new.
             for (int idx = tid; idx < total; idx += blockDim.x) {
-                int t_in, localIdx;
-                if (idx < offset1) { t_in = 3; localIdx = idx; }
-                else if (idx < offset2) { t_in = 4; localIdx = idx - offset1; }
-                else if (idx < offset3) { t_in = 5; localIdx = idx - offset2; }
-                else { t_in = 6; localIdx = idx - offset3; }
-
+                ComboIndex combo = d_comboLookup[idx];
+                int t_in = combo.t_in;
                 int t_out = k - t_in;
-                int c_out = (t_out == 3) ? 12341 : (t_out == 2) ? 903 : (t_out == 1) ? 43 : 1;
-                int combo_in = localIdx / c_out;
-                int combo_out = localIdx - combo_in * c_out;
+                int combo_in = combo.combo_in;
+                int combo_out = combo.combo_out;
 
                 int blockSel[6];
                 int outSel[6];
@@ -1203,16 +1192,11 @@ __global__ void singleRunFastRRKernel(mask_t* solutions,
 
             // Increment counts for subsets covered by new but not by old.
             for (int idx = tid; idx < total; idx += blockDim.x) {
-                int t_in, localIdx;
-                if (idx < offset1) { t_in = 3; localIdx = idx; }
-                else if (idx < offset2) { t_in = 4; localIdx = idx - offset1; }
-                else if (idx < offset3) { t_in = 5; localIdx = idx - offset2; }
-                else { t_in = 6; localIdx = idx - offset3; }
-
+                ComboIndex combo = d_comboLookup[idx];
+                int t_in = combo.t_in;
                 int t_out = k - t_in;
-                int c_out = (t_out == 3) ? 12341 : (t_out == 2) ? 903 : (t_out == 1) ? 43 : 1;
-                int combo_in = localIdx / c_out;
-                int combo_out = localIdx - combo_in * c_out;
+                int combo_in = combo.combo_in;
+                int combo_out = combo.combo_out;
 
                 int blockSel[6];
                 int outSel[6];
@@ -1319,9 +1303,6 @@ __global__ void multiRunFastRRKernel(mask_t* solutions,
     __shared__ int sharedImproved;
 
     const int total = 260624;
-    const int offset1 = 246820;
-    const int offset2 = 260365;
-    const int offset3 = 260623;
     const int v = 49;
     const int k = 6;
     const int t = 3;
@@ -1360,16 +1341,11 @@ __global__ void multiRunFastRRKernel(mask_t* solutions,
 
         // OLD block: subsets covered by old but not by new.
         for (int idx = tid; idx < total; idx += blockDim.x) {
-            int t_in, localIdx;
-            if (idx < offset1) { t_in = 3; localIdx = idx; }
-            else if (idx < offset2) { t_in = 4; localIdx = idx - offset1; }
-            else if (idx < offset3) { t_in = 5; localIdx = idx - offset2; }
-            else { t_in = 6; localIdx = idx - offset3; }
-
+            ComboIndex combo = d_comboLookup[idx];
+            int t_in = combo.t_in;
             int t_out = k - t_in;
-            int c_out = (t_out == 3) ? 12341 : (t_out == 2) ? 903 : (t_out == 1) ? 43 : 1;
-            int combo_in = localIdx / c_out;
-            int combo_out = localIdx - combo_in * c_out;
+            int combo_in = combo.combo_in;
+            int combo_out = combo.combo_out;
 
             int blockSel[6];
             int outSel[6];
@@ -1434,16 +1410,11 @@ __global__ void multiRunFastRRKernel(mask_t* solutions,
 
         // NEW block: subsets covered by new but not by old.
         for (int idx = tid; idx < total; idx += blockDim.x) {
-            int t_in, localIdx;
-            if (idx < offset1) { t_in = 3; localIdx = idx; }
-            else if (idx < offset2) { t_in = 4; localIdx = idx - offset1; }
-            else if (idx < offset3) { t_in = 5; localIdx = idx - offset2; }
-            else { t_in = 6; localIdx = idx - offset3; }
-
+            ComboIndex combo = d_comboLookup[idx];
+            int t_in = combo.t_in;
             int t_out = k - t_in;
-            int c_out = (t_out == 3) ? 12341 : (t_out == 2) ? 903 : (t_out == 1) ? 43 : 1;
-            int combo_in = localIdx / c_out;
-            int combo_out = localIdx - combo_in * c_out;
+            int combo_in = combo.combo_in;
+            int combo_out = combo.combo_out;
 
             int blockSel[6];
             int outSel[6];
@@ -1533,16 +1504,11 @@ __global__ void multiRunFastRRKernel(mask_t* solutions,
         if (sharedAccept) {
             // Decrement counts for subsets covered by old but not by new.
             for (int idx = tid; idx < total; idx += blockDim.x) {
-                int t_in, localIdx;
-                if (idx < offset1) { t_in = 3; localIdx = idx; }
-                else if (idx < offset2) { t_in = 4; localIdx = idx - offset1; }
-                else if (idx < offset3) { t_in = 5; localIdx = idx - offset2; }
-                else { t_in = 6; localIdx = idx - offset3; }
-
+                ComboIndex combo = d_comboLookup[idx];
+                int t_in = combo.t_in;
                 int t_out = k - t_in;
-                int c_out = (t_out == 3) ? 12341 : (t_out == 2) ? 903 : (t_out == 1) ? 43 : 1;
-                int combo_in = localIdx / c_out;
-                int combo_out = localIdx - combo_in * c_out;
+                int combo_in = combo.combo_in;
+                int combo_out = combo.combo_out;
 
                 int blockSel[6];
                 int outSel[6];
@@ -1607,16 +1573,11 @@ __global__ void multiRunFastRRKernel(mask_t* solutions,
 
             // Increment counts for subsets covered by new but not by old.
             for (int idx = tid; idx < total; idx += blockDim.x) {
-                int t_in, localIdx;
-                if (idx < offset1) { t_in = 3; localIdx = idx; }
-                else if (idx < offset2) { t_in = 4; localIdx = idx - offset1; }
-                else if (idx < offset3) { t_in = 5; localIdx = idx - offset2; }
-                else { t_in = 6; localIdx = idx - offset3; }
-
+                ComboIndex combo = d_comboLookup[idx];
+                int t_in = combo.t_in;
                 int t_out = k - t_in;
-                int c_out = (t_out == 3) ? 12341 : (t_out == 2) ? 903 : (t_out == 1) ? 43 : 1;
-                int combo_in = localIdx / c_out;
-                int combo_out = localIdx - combo_in * c_out;
+                int combo_in = combo.combo_in;
+                int combo_out = combo.combo_out;
 
                 int blockSel[6];
                 int outSel[6];
@@ -1714,13 +1675,9 @@ __global__ void deltaEvaluateFastCounts(mask_t* solutions,
     __shared__ uint8_t newOutside[43];
 
     const int total = 260624;
-    const int offset1 = 246820;
-    const int offset2 = 260365;
-    const int offset3 = 260623;
     const int v = 49;
     const int k = 6;
     const int t = 3;
-    const int vMinusK = 43;
 
     int blocksPerSol = d_blocksPerSol;
     int solIdx = blockIdx.x / blocksPerSol;
@@ -1753,16 +1710,11 @@ __global__ void deltaEvaluateFastCounts(mask_t* solutions,
 
     // OLD block: subsets covered by old but not by new.
     for (int idx = globalTid; idx < total; idx += totalThreads) {
-        int t_in, localIdx;
-        if (idx < offset1) { t_in = 3; localIdx = idx; }
-        else if (idx < offset2) { t_in = 4; localIdx = idx - offset1; }
-        else if (idx < offset3) { t_in = 5; localIdx = idx - offset2; }
-        else { t_in = 6; localIdx = idx - offset3; }
-
+        ComboIndex combo = d_comboLookup[idx];
+        int t_in = combo.t_in;
         int t_out = k - t_in;
-        int c_out = (t_out == 3) ? 12341 : (t_out == 2) ? 903 : (t_out == 1) ? 43 : 1;
-        int combo_in = localIdx / c_out;
-        int combo_out = localIdx - combo_in * c_out;
+        int combo_in = combo.combo_in;
+        int combo_out = combo.combo_out;
 
         int blockSel[6];
         int outSel[6];
@@ -1827,16 +1779,11 @@ __global__ void deltaEvaluateFastCounts(mask_t* solutions,
 
     // NEW block: subsets covered by new but not by old.
     for (int idx = globalTid; idx < total; idx += totalThreads) {
-        int t_in, localIdx;
-        if (idx < offset1) { t_in = 3; localIdx = idx; }
-        else if (idx < offset2) { t_in = 4; localIdx = idx - offset1; }
-        else if (idx < offset3) { t_in = 5; localIdx = idx - offset2; }
-        else { t_in = 6; localIdx = idx - offset3; }
-
+        ComboIndex combo = d_comboLookup[idx];
+        int t_in = combo.t_in;
         int t_out = k - t_in;
-        int c_out = (t_out == 3) ? 12341 : (t_out == 2) ? 903 : (t_out == 1) ? 43 : 1;
-        int combo_in = localIdx / c_out;
-        int combo_out = localIdx - combo_in * c_out;
+        int combo_in = combo.combo_in;
+        int combo_out = combo.combo_out;
 
         int blockSel[6];
         int outSel[6];
@@ -1930,9 +1877,6 @@ __global__ void updateCoverageCountsFast(mask_t* solutions,
     __shared__ uint8_t newOutside[43];
 
     const int total = 260624;
-    const int offset1 = 246820;
-    const int offset2 = 260365;
-    const int offset3 = 260623;
     const int v = 49;
     const int k = 6;
     const int t = 3;
@@ -1968,16 +1912,11 @@ __global__ void updateCoverageCountsFast(mask_t* solutions,
 
         // Decrement counts for subsets covered by old but not by new.
         for (int idx = globalTid; idx < total; idx += totalThreads) {
-            int t_in, localIdx;
-            if (idx < offset1) { t_in = 3; localIdx = idx; }
-            else if (idx < offset2) { t_in = 4; localIdx = idx - offset1; }
-            else if (idx < offset3) { t_in = 5; localIdx = idx - offset2; }
-            else { t_in = 6; localIdx = idx - offset3; }
-
+            ComboIndex combo = d_comboLookup[idx];
+            int t_in = combo.t_in;
             int t_out = k - t_in;
-            int c_out = (t_out == 3) ? 12341 : (t_out == 2) ? 903 : (t_out == 1) ? 43 : 1;
-            int combo_in = localIdx / c_out;
-            int combo_out = localIdx - combo_in * c_out;
+            int combo_in = combo.combo_in;
+            int combo_out = combo.combo_out;
 
             int blockSel[6];
             int outSel[6];
@@ -2042,16 +1981,11 @@ __global__ void updateCoverageCountsFast(mask_t* solutions,
 
         // Increment counts for subsets covered by new but not by old.
         for (int idx = globalTid; idx < total; idx += totalThreads) {
-            int t_in, localIdx;
-            if (idx < offset1) { t_in = 3; localIdx = idx; }
-            else if (idx < offset2) { t_in = 4; localIdx = idx - offset1; }
-            else if (idx < offset3) { t_in = 5; localIdx = idx - offset2; }
-            else { t_in = 6; localIdx = idx - offset3; }
-
+            ComboIndex combo = d_comboLookup[idx];
+            int t_in = combo.t_in;
             int t_out = k - t_in;
-            int c_out = (t_out == 3) ? 12341 : (t_out == 2) ? 903 : (t_out == 1) ? 43 : 1;
-            int combo_in = localIdx / c_out;
-            int combo_out = localIdx - combo_in * c_out;
+            int combo_in = combo.combo_in;
+            int combo_out = combo.combo_out;
 
             int blockSel[6];
             int outSel[6];
@@ -2816,6 +2750,49 @@ static int generateCombos(int n, int k, uint8_t* out) {
     return count;
 }
 
+static ComboIndex* buildComboLookup(int* totalOut) {
+    const int offset1 = 246820;
+    const int offset2 = 260365;
+    const int offset3 = 260623;
+    const int total = 260624;
+    ComboIndex* table = (ComboIndex*)malloc((size_t)total * sizeof(ComboIndex));
+    if (!table) return NULL;
+
+    for (int idx = 0; idx < total; idx++) {
+        int t_in;
+        int localIdx;
+        int c_out;
+
+        if (idx < offset1) {
+            t_in = 3;
+            localIdx = idx;
+            c_out = 12341;
+        } else if (idx < offset2) {
+            t_in = 4;
+            localIdx = idx - offset1;
+            c_out = 903;
+        } else if (idx < offset3) {
+            t_in = 5;
+            localIdx = idx - offset2;
+            c_out = 43;
+        } else {
+            t_in = 6;
+            localIdx = idx - offset3;
+            c_out = 1;
+        }
+
+        int combo_in = localIdx / c_out;
+        int combo_out = localIdx - combo_in * c_out;
+
+        table[idx].t_in = (uint8_t)t_in;
+        table[idx].combo_in = (uint8_t)combo_in;
+        table[idx].combo_out = (uint16_t)combo_out;
+    }
+
+    if (totalOut) *totalOut = total;
+    return table;
+}
+
 void printSolution(mask_t* solution, int b, int k, FILE* outFile) {
     for (int i = 0; i < b; i++) {
         mask_t mask = solution[i];
@@ -3265,6 +3242,10 @@ int main(int argc, char* argv[]) {
     int* d_deltaCosts = NULL;
     uint8_t* d_coverageCounts = NULL;  // Coverage count per m-subset per solution
     int* d_accepted = NULL;  // Track which solutions accepted the move
+    ComboIndex* d_comboLookupBuffer = NULL;
+    ComboIndex* h_comboLookup = NULL;
+    size_t comboBytes = 0;
+    int comboTotal = 0;
     
     
     if (useParallel) {
@@ -3305,6 +3286,23 @@ int main(int argc, char* argv[]) {
 
     if (useFastDelta && useParallel && useExact && d_coverageCounts != NULL) {
         useFastCounts = 1;
+    }
+
+    if (useFastCounts) {
+        h_comboLookup = buildComboLookup(&comboTotal);
+        if (!h_comboLookup) {
+            printf("[CUDA] ERROR: Failed to allocate combo lookup table\n");
+            return 1;
+        }
+        comboBytes = (size_t)comboTotal * sizeof(ComboIndex);
+        err = cudaMalloc(&d_comboLookupBuffer, comboBytes);
+        if (err != cudaSuccess) {
+            printf("[CUDA] ERROR: cudaMalloc failed for combo lookup: %s\n", cudaGetErrorString(err));
+            free(h_comboLookup);
+            return 1;
+        }
+        cudaMemcpy(d_comboLookupBuffer, h_comboLookup, comboBytes, cudaMemcpyHostToDevice);
+        cudaMemcpyToSymbol(d_comboLookup, &d_comboLookupBuffer, sizeof(ComboIndex*));
     }
 
     if (useFastCounts) {
@@ -4314,6 +4312,7 @@ int main(int argc, char* argv[]) {
     if (d_deltaCosts) cudaFree(d_deltaCosts);
     if (d_coverageCounts) cudaFree(d_coverageCounts);
     if (d_accepted) cudaFree(d_accepted);
+    if (d_comboLookupBuffer) cudaFree(d_comboLookupBuffer);
     
     free(h_bestCosts);
     free(h_costs);
@@ -4321,6 +4320,7 @@ int main(int argc, char* argv[]) {
     free(h_temperatures);
     if (h_startSolution) free(h_startSolution);
     if (h_mSubsetMasks) free(h_mSubsetMasks);
+    if (h_comboLookup) free(h_comboLookup);
     
     return 0;
 }

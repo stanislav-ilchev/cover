@@ -2202,7 +2202,8 @@ __global__ void parallelSABatch(mask_t* allSolutions,
     float temperature = temperatures[runIdx];
     
     // Run a small batch of SA iterations
-    for (int iter = 0; iter < batchSize; iter++) {
+    int iterations = 0;
+    while (iterations < batchSize) {
         // Make a move
         int blkIdx = curand(&localState) % d_b;
         mask_t oldBlock = solution[blkIdx];
@@ -2233,8 +2234,10 @@ __global__ void parallelSABatch(mask_t* allSolutions,
                     bestSolutions[runIdx * d_b + i] = solution[i];
                 }
             }
+            iterations = 0;
         } else {
             solution[blkIdx] = oldBlock;
+            iterations++;
         }
         
         // Cool down every iteration in batch
@@ -2272,7 +2275,8 @@ __global__ void parallelRRBatch(mask_t* allSolutions,
     int acceptLimit = bestCost + threshold;
     
     // Run a batch of RR iterations
-    for (int iter = 0; iter < batchSize; iter++) {
+    int iterations = 0;
+    while (iterations < batchSize) {
         // Make a move
         int blkIdx = curand(&localState) % d_b;
         mask_t oldBlock = solution[blkIdx];
@@ -2297,9 +2301,11 @@ __global__ void parallelRRBatch(mask_t* allSolutions,
                     bestSolutions[runIdx * d_b + i] = solution[i];
                 }
             }
+            iterations = 0;
         } else {
             // Reject - revert
             solution[blkIdx] = oldBlock;
+            iterations++;
         }
     }
     
@@ -3817,4 +3823,3 @@ int main(int argc, char* argv[]) {
     
     return 0;
 }
-

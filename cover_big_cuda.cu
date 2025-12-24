@@ -3457,6 +3457,7 @@ int main(int argc, char* argv[]) {
         
         int totalIters = 0;
         int lastBestCost = initCost;
+        clock_t lastImprovementTime = roundStart;
         
         for (int batch = 0; batch < batchesPerRound; batch++) {
             int itersThis = batchSize;
@@ -3626,6 +3627,7 @@ int main(int argc, char* argv[]) {
                     printf("    %6d    %6d    %6d   %6.1fs  *\n",
                            totalIters, currentCost, currentBest, elapsed);
                     lastBestCost = currentBest;
+                    lastImprovementTime = clock();
                     fflush(stdout);
 
                     if (currentBest == 0) {
@@ -3651,6 +3653,17 @@ int main(int argc, char* argv[]) {
 
                         stopEarly = 1;
                         break;
+                    }
+                }
+
+                if (useRR) {
+                    double sinceImprove = (double)(clock() - lastImprovementTime) / CLOCKS_PER_SEC;
+                    if (sinceImprove >= 300.0) {
+                        rrThreshold += 1;
+                        lastImprovementTime = clock();
+                        printf("No improvement for 5 min; increasing threshold to %d\n",
+                               rrThreshold);
+                        fflush(stdout);
                     }
                 }
             } else {
@@ -3702,7 +3715,19 @@ int main(int argc, char* argv[]) {
                     printf("    %6d    %6d    %6d   %6.1fs  *\n",
                            totalIters, currentCost, currentBest, elapsed);
                     lastBestCost = currentBest;
+                    lastImprovementTime = clock();
                     fflush(stdout);
+                }
+
+                if (useRR) {
+                    double sinceImprove = (double)(clock() - lastImprovementTime) / CLOCKS_PER_SEC;
+                    if (sinceImprove >= 300.0) {
+                        rrThreshold += 1;
+                        lastImprovementTime = clock();
+                        printf("No improvement for 5 min; increasing threshold to %d\n",
+                               rrThreshold);
+                        fflush(stdout);
+                    }
                 }
             }
         }

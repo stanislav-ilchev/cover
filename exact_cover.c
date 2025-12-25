@@ -30,6 +30,33 @@ typedef struct {
   int report;
 } SearchContext;
 
+typedef enum {
+  SEARCH_DFS = 0,
+  SEARCH_DLX = 1
+} SearchAlgo;
+
+typedef struct {
+  int *left;
+  int *right;
+  int *up;
+  int *down;
+  int *row;
+  int *col;
+  int *colSize;
+  int *rowHead;
+  unsigned char *colActive;
+  size_t nodeCount;
+  size_t nodeCap;
+  int header;
+  int activeColumns;
+} DlxMatrix;
+
+typedef struct {
+  int *solution;
+  unsigned char *rowUsed;
+  int report;
+} DlxContext;
+
 static int v = 27;
 static int k = 6;
 static int m = 4;
@@ -37,6 +64,7 @@ static int t = 3;
 static int limit = 86;
 static int fixFirst = 1;
 static int threads = 1;
+static SearchAlgo algo = SEARCH_DFS;
 static char resultFileName[256] = "exact_solution.txt";
 
 static mask_t *blocks = NULL;
@@ -53,6 +81,7 @@ static int maxCover = 0;
 static int foundDepth = -1;
 static int *bestSolution = NULL;
 static int candidateCapacity = 0;
+static DlxMatrix dlx = {0};
 
 static atomic_uint_fast64_t nodesVisited;
 static atomic_uint_fast64_t *depthNodes = NULL;
@@ -188,6 +217,155 @@ static int map_get(const MaskMap *map, mask_t key)
   return -1;
 }
 
+static void dlx_init(DlxMatrix *matrix, size_t nodeCap, int columns, int rows)
+{
+  size_t i;
+  matrix->nodeCap = nodeCap;
+  matrix->nodeCount = (size_t) columns + 1;
+  matrix->header = 0;
+  matrix->left = (int *) malloc(sizeof(int) * nodeCap);
+  matrix->right = (int *) malloc(sizeof(int) * nodeCap);
+  matrix->up = (int *) malloc(sizeof(int) * nodeCap);
+  matrix->down = (int *) malloc(sizeof(int) * nodeCap);
+  matrix->row = (int *) malloc(sizeof(int) * nodeCap);
+  matrix->col = (int *) malloc(sizeof(int) * nodeCap);
+  matrix->colSize = (int *) calloc((size_t) columns + 1, sizeof(int));
+  matrix->rowHead = (int *) malloc(sizeof(int) * (size_t) rows);
+  matrix->colActive = (unsigned char *) malloc((size_t) columns + 1);
+  if(!matrix->left || !matrix->right || !matrix->up || !matrix->down ||
+     !matrix->row || !matrix->col || !matrix->colSize || !matrix->rowHead ||
+     !matrix->colActive) {
+    fprintf(stderr, "ERROR: out of memory for DLX matrix\n");
+    exit(1);
+  }
+  for(i = 0; i < (size_t) rows; i++)
+    matrix->rowHead[i] = -1;
+  matrix->left[0] = columns;
+  matrix->right[0] = columns ? 1 : 0;
+  for(i = 1; i <= (size_t) columns; i++) {
+    int idx = (int) i;
+    matrix->left[idx] = idx - 1;
+    matrix->right[idx] = (idx == columns) ? 0 : idx + 1;
+    matrix->up[idx] = idx;
+    matrix->down[idx] = idx;
+    matrix->row[idx] = -1;
+    matrix->col[idx] = idx;
+    matrix->colActive[idx] = 1;
+  }
+  matrix->activeColumns = columns;
+}
+
+static void dlx_free(DlxMatrix *matrix)
+{
+  free(matrix->left);
+  free(matrix->right);
+  free(matrix->up);
+  free(matrix->down);
+  free(matrix->row);
+  free(matrix->col);
+  free(matrix->colSize);
+  free(matrix->rowHead);
+  free(matrix->colActive);
+  memset(matrix, 0, sizeof(*matrix));
+}
+
+static void dlx_add_node(DlxMatrix *matrix, int rowIndex, int colIndex, int *first, int *prev)
+{
+  int node = (int) matrix->nodeCount;
+  matrix->nodeCount++;
+  if(matrix->nodeCount > matrix->nodeCap) {
+    fprintf(stderr, "ERROR: DLX node capacity exceeded\n");
+    exit(1);
+  }
+  matrix->row[node] = rowIndex;
+  matrix->col[node] = colIndex;
+
+  matrix->up[node] = matrix->up[colIndex];
+  matrix->down[node] = colIndex;
+  matrix->down[matrix->up[colIndex]] = node;
+  matrix->up[colIndex] = node;
+  matrix->colSize[colIndex]++;
+
+  if(*first == -1) {
+    *first = node;
+    matrix->left[node] = node;
+    matrix->right[node] = node;
+  } else {
+    matrix->left[node] = *prev;
+    matrix->right[node] = *first;
+    matrix->right[*prev] = node;
+    matrix->left[*first] = node;
+  }
+  *prev = node;
+}
+
+static void dlx_remove_column(DlxMatrix *matrix, int colIndex)
+{
+  if(!matrix->colActive[colIndex])
+    return;
+  matrix->right[matrix->left[colIndex]] = matrix->right[colIndex];
+  matrix->left[matrix->right[colIndex]] = matrix->left[colIndex];
+  matrix->colActive[colIndex] = 0;
+  matrix->activeColumns--;
+}
+
+static void dlx_restore_column(DlxMatrix *matrix, int colIndex)
+{
+  if(matrix->colActive[colIndex])
+    return;
+  matrix->right[matrix->left[colIndex]] = colIndex;
+  matrix->left[matrix->right[colIndex]] = colIndex;
+  matrix->colActive[colIndex] = 1;
+  matrix->activeColumns++;
+}
+
+static int dlx_select_column(const DlxMatrix *matrix, const unsigned char *rowUsed,
+                             int lastRow, int *candCount)
+{
+  int col = matrix->right[matrix->header];
+  int bestCol = -1;
+  int bestCount = INT_MAX;
+  for(; col != matrix->header; col = matrix->right[col]) {
+    int count = 0;
+    int node;
+    for(node = matrix->down[col]; node != col; node = matrix->down[node]) {
+      int rowIndex = matrix->row[node];
+      if(rowIndex > lastRow && !rowUsed[rowIndex])
+        count++;
+    }
+    if(count < bestCount) {
+      bestCount = count;
+      bestCol = col;
+      if(bestCount <= 1)
+        break;
+    }
+  }
+  if(candCount)
+    *candCount = bestCount == INT_MAX ? 0 : bestCount;
+  return bestCol;
+}
+
+static int dlx_cover_row(DlxMatrix *matrix, int rowNode, int *removedCols, int removedCap)
+{
+  int count = 0;
+  int node = rowNode;
+  if(node < 0)
+    return 0;
+  do {
+    int colIndex = matrix->col[node];
+    if(matrix->colActive[colIndex]) {
+      if(count >= removedCap) {
+        fprintf(stderr, "ERROR: DLX removed column stack overflow\n");
+        exit(1);
+      }
+      removedCols[count++] = colIndex;
+      dlx_remove_column(matrix, colIndex);
+    }
+    node = matrix->right[node];
+  } while(node != rowNode);
+  return count;
+}
+
 static int next_combination(int *comb, int r, int n)
 {
   int i = r - 1;
@@ -283,6 +461,66 @@ static void build_block_points(void)
       else
         blockOutside[i * outsideCount + outsideIndex++] = p;
     }
+  }
+}
+
+static void build_dlx_matrix(void)
+{
+  size_t nodeCap;
+  int insideCount = k;
+  int outsideCount = v - k;
+  int bindex;
+
+  if(blockCount <= 0 || maxCover <= 0 || drawCount <= 0) {
+    fprintf(stderr, "ERROR: invalid dimensions for DLX matrix\n");
+    exit(1);
+  }
+  if((size_t) blockCount > SIZE_MAX / (size_t) maxCover) {
+    fprintf(stderr, "ERROR: DLX matrix size overflow\n");
+    exit(1);
+  }
+  nodeCap = (size_t) blockCount * (size_t) maxCover + (size_t) drawCount + 1;
+  dlx_init(&dlx, nodeCap, drawCount, blockCount);
+
+  for(bindex = 0; bindex < blockCount; bindex++) {
+    int first = -1;
+    int prev = -1;
+    const int *pts = blockPoints + bindex * insideCount;
+    const int *outside = blockOutside + bindex * outsideCount;
+    int i, j, kidx, l, o;
+
+    for(i = 0; i < insideCount - 3; i++) {
+      for(j = i + 1; j < insideCount - 2; j++) {
+        for(kidx = j + 1; kidx < insideCount - 1; kidx++) {
+          for(l = kidx + 1; l < insideCount; l++) {
+            mask_t dmask = ((mask_t) 1u << pts[i]) |
+                           ((mask_t) 1u << pts[j]) |
+                           ((mask_t) 1u << pts[kidx]) |
+                           ((mask_t) 1u << pts[l]);
+            int dindex = map_get(&drawMap, dmask);
+            if(dindex >= 0)
+              dlx_add_node(&dlx, bindex, dindex + 1, &first, &prev);
+          }
+        }
+      }
+    }
+
+    for(i = 0; i < insideCount - 2; i++) {
+      for(j = i + 1; j < insideCount - 1; j++) {
+        for(kidx = j + 1; kidx < insideCount; kidx++) {
+          for(o = 0; o < outsideCount; o++) {
+            mask_t dmask = ((mask_t) 1u << pts[i]) |
+                           ((mask_t) 1u << pts[j]) |
+                           ((mask_t) 1u << pts[kidx]) |
+                           ((mask_t) 1u << outside[o]);
+            int dindex = map_get(&drawMap, dmask);
+            if(dindex >= 0)
+              dlx_add_node(&dlx, bindex, dindex + 1, &first, &prev);
+          }
+        }
+      }
+    }
+    dlx.rowHead[bindex] = first;
   }
 }
 
@@ -618,6 +856,60 @@ static int search(SearchContext *ctx, int depth, int lastBlockIndex)
   return 0;
 }
 
+static int dlx_search(DlxContext *ctx, int depth, int lastRow)
+{
+  int col;
+  int candCount = 0;
+  int node;
+
+  atomic_fetch_add(&nodesVisited, 1);
+  if(atomic_load(&foundFlag))
+    return 1;
+  if(dlx.activeColumns == 0) {
+    pthread_mutex_lock(&solutionMutex);
+    if(!atomic_load(&foundFlag)) {
+      foundDepth = depth;
+      memcpy(bestSolution, ctx->solution, sizeof(int) * depth);
+      atomic_store(&foundFlag, 1);
+    }
+    pthread_mutex_unlock(&solutionMutex);
+    return 1;
+  }
+  if(depth >= limit)
+    return 0;
+  if(depth + (dlx.activeColumns + maxCover - 1) / maxCover > limit)
+    return 0;
+
+  col = dlx_select_column(&dlx, ctx->rowUsed, lastRow, &candCount);
+  if(col < 0 || candCount == 0)
+    return 0;
+  if(ctx->report)
+    report_progress(depth, dlx.activeColumns, candCount);
+
+  for(node = dlx.down[col]; node != col; node = dlx.down[node]) {
+    int rowIndex = dlx.row[node];
+    int removedCols[maxCover];
+    int removedCount;
+    int i;
+
+    if(rowIndex <= lastRow || ctx->rowUsed[rowIndex])
+      continue;
+    ctx->rowUsed[rowIndex] = 1;
+    ctx->solution[depth] = rowIndex;
+    removedCount = dlx_cover_row(&dlx, node, removedCols, maxCover);
+
+    if(dlx_search(ctx, depth + 1, rowIndex))
+      return 1;
+
+    for(i = removedCount - 1; i >= 0; i--)
+      dlx_restore_column(&dlx, removedCols[i]);
+    ctx->rowUsed[rowIndex] = 0;
+    if(atomic_load(&foundFlag))
+      return 1;
+  }
+  return 0;
+}
+
 static void print_block(FILE *fp, mask_t block)
 {
   int i;
@@ -649,7 +941,7 @@ static void write_solution(int depth)
 static void usage(const char *prog)
 {
   fprintf(stderr,
-          "Usage: %s [v=27 k=6 m=4 t=3 b=86 fixFirst=1 threads=1 result=exact_solution.txt]\n",
+          "Usage: %s [v=27 k=6 m=4 t=3 b=86 fixFirst=1 threads=1 algo=dfs result=exact_solution.txt]\n",
           prog);
 }
 
@@ -671,6 +963,14 @@ static void parse_args(int argc, char **argv)
       continue;
     if(sscanf(argv[i], "threads=%d", &threads) == 1)
       continue;
+    if(strcmp(argv[i], "algo=dfs") == 0) {
+      algo = SEARCH_DFS;
+      continue;
+    }
+    if(strcmp(argv[i], "algo=dlx") == 0) {
+      algo = SEARCH_DLX;
+      continue;
+    }
     if(sscanf(argv[i], "result=%255s", resultFileName) == 1)
       continue;
     usage(argv[0]);
@@ -772,10 +1072,11 @@ int main(int argc, char **argv)
   int depth = 0;
   int threadCount;
   mask_t firstMask = 0;
-  uint64_t *base;
-  uint64_t *baseUncovered;
+  uint64_t *base = NULL;
+  uint64_t *baseUncovered = NULL;
   int *baseSolution;
   SearchContext *mainCtx = NULL;
+  DlxContext dlxCtx = {0};
 
   parse_args(argc, argv);
 
@@ -802,17 +1103,29 @@ int main(int argc, char **argv)
 
   bitsetWords = (drawCount + 63) / 64;
   candidateCapacity = (int) (choose_u64(4, 3) * choose_u64(v - 3, 3));
-  mainCtx = create_context();
-  if(!mainCtx) {
-    fprintf(stderr, "ERROR: out of memory for bitsets\n");
-    return 1;
-  }
+  maxCover = (int) (choose_u64(k, 4) + choose_u64(k, 3) * (v - k));
 
-  base = mainCtx->uncoveredStack[0];
-  for(i = 0; i < bitsetWords; i++)
-    base[i] = ~0ull;
-  if(drawCount % 64)
-    base[bitsetWords - 1] &= (1ull << (drawCount % 64)) - 1;
+  if(algo == SEARCH_DFS) {
+    mainCtx = create_context();
+    if(!mainCtx) {
+      fprintf(stderr, "ERROR: out of memory for bitsets\n");
+      return 1;
+    }
+
+    base = mainCtx->uncoveredStack[0];
+    for(i = 0; i < bitsetWords; i++)
+      base[i] = ~0ull;
+    if(drawCount % 64)
+      base[bitsetWords - 1] &= (1ull << (drawCount % 64)) - 1;
+  } else {
+    build_dlx_matrix();
+    dlxCtx.solution = (int *) malloc(sizeof(int) * limit);
+    dlxCtx.rowUsed = (unsigned char *) calloc((size_t) blockCount, sizeof(unsigned char));
+    if(!dlxCtx.solution || !dlxCtx.rowUsed) {
+      fprintf(stderr, "ERROR: out of memory for DLX context\n");
+      return 1;
+    }
+  }
 
   bestSolution = (int *) malloc(sizeof(int) * limit);
   baseSolution = (int *) calloc(limit, sizeof(int));
@@ -829,8 +1142,6 @@ int main(int argc, char **argv)
   atomic_init(&nodesVisited, 0);
   atomic_init(&foundFlag, 0);
 
-  maxCover = (int) (choose_u64(k, 4) + choose_u64(k, 3) * (v - k));
-
   if(fixFirst) {
     for(i = 0; i < k; i++)
       firstMask |= (mask_t) 1u << i;
@@ -839,32 +1150,50 @@ int main(int argc, char **argv)
       fprintf(stderr, "ERROR: failed to find fixed first block\n");
       return 1;
     }
-    memcpy(mainCtx->uncoveredStack[1], base, sizeof(uint64_t) * bitsetWords);
-    apply_block(baseSolution[0], mainCtx->uncoveredStack[1]);
-    depth = 1;
+    if(algo == SEARCH_DFS) {
+      memcpy(mainCtx->uncoveredStack[1], base, sizeof(uint64_t) * bitsetWords);
+      apply_block(baseSolution[0], mainCtx->uncoveredStack[1]);
+      depth = 1;
+    } else {
+      int removedCols[maxCover];
+      int rowNode = dlx.rowHead[baseSolution[0]];
+      if(rowNode < 0) {
+        fprintf(stderr, "ERROR: failed to locate DLX row for fixed first block\n");
+        return 1;
+      }
+      dlxCtx.rowUsed[baseSolution[0]] = 1;
+      dlxCtx.solution[0] = baseSolution[0];
+      dlx_cover_row(&dlx, rowNode, removedCols, maxCover);
+      depth = 1;
+    }
   }
-  baseUncovered = mainCtx->uncoveredStack[depth];
-  mainCtx->report = 1;
+  if(algo == SEARCH_DFS) {
+    baseUncovered = mainCtx->uncoveredStack[depth];
+    mainCtx->report = 1;
+  } else {
+    dlxCtx.report = 1;
+  }
 
   startTime = time(NULL);
   lastReport = 0;
-  printf("Starting exact cover search: v=%d k=%d m=%d t=%d b=%d blocks=%d draws=%d\n",
-         v, k, m, t, limit, blockCount, drawCount);
+  printf("Starting exact cover search: v=%d k=%d m=%d t=%d b=%d blocks=%d draws=%d algo=%s\n",
+         v, k, m, t, limit, blockCount, drawCount,
+         algo == SEARCH_DLX ? "dlx" : "dfs");
   fflush(stdout);
 
   if(threads < 1)
     threads = 1;
 
-  if(threads == 1) {
+  if(algo == SEARCH_DLX) {
+    if(threads > 1)
+      printf("NOTE: DLX solver runs single-threaded; ignoring threads=%d\n", threads);
+    if(depth > 0)
+      memcpy(dlxCtx.solution, baseSolution, sizeof(int) * depth);
+    dlx_search(&dlxCtx, depth, depth ? baseSolution[depth - 1] : -1);
+  } else if(threads == 1) {
     if(depth > 0)
       memcpy(mainCtx->solution, baseSolution, sizeof(int) * depth);
-    if(search(mainCtx, depth, depth ? baseSolution[depth - 1] : -1)) {
-      printf("Found solution with %d blocks. Writing to %s\n", foundDepth, resultFileName);
-      write_solution(foundDepth);
-      free_context(mainCtx);
-      free(baseSolution);
-      return 0;
-    }
+    search(mainCtx, depth, depth ? baseSolution[depth - 1] : -1);
   } else {
     int dindex = select_best_draw(mainCtx, baseUncovered, depth ? baseSolution[depth - 1] : -1);
     mask_t drawMask = draws[dindex];
@@ -886,8 +1215,14 @@ int main(int argc, char **argv)
     if(candCount == 0) {
       free(candidates);
       printf("No solution found with b <= %d\n", limit);
-      free_context(mainCtx);
+      if(mainCtx)
+        free_context(mainCtx);
       free(baseSolution);
+      if(algo == SEARCH_DLX) {
+        dlx_free(&dlx);
+        free(dlxCtx.solution);
+        free(dlxCtx.rowUsed);
+      }
       return 0;
     }
     for(i = 0; i < candCount; i++)
@@ -931,18 +1266,21 @@ int main(int argc, char **argv)
     free(workItems);
     free(threadIds);
     free(candidates);
-
-    if(atomic_load(&foundFlag)) {
-      printf("Found solution with %d blocks. Writing to %s\n", foundDepth, resultFileName);
-      write_solution(foundDepth);
-      free_context(mainCtx);
-      free(baseSolution);
-      return 0;
-    }
   }
 
-  printf("No solution found with b <= %d\n", limit);
-  free_context(mainCtx);
+  if(atomic_load(&foundFlag)) {
+    printf("Found solution with %d blocks. Writing to %s\n", foundDepth, resultFileName);
+    write_solution(foundDepth);
+  } else {
+    printf("No solution found with b <= %d\n", limit);
+  }
+  if(mainCtx)
+    free_context(mainCtx);
   free(baseSolution);
+  if(algo == SEARCH_DLX) {
+    dlx_free(&dlx);
+    free(dlxCtx.solution);
+    free(dlxCtx.rowUsed);
+  }
   return 0;
 }

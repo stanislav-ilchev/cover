@@ -4,6 +4,8 @@
 #include <limits.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <inttypes.h>
 
 typedef uint32_t mask_t;
@@ -19,35 +21,47 @@ typedef struct {
   int gain;
 } Candidate;
 
+typedef struct {
+  uint64_t **uncoveredStack;
+  int *solution;
+  int *stamp;
+  int stampValue;
+  int report;
+} SearchContext;
+
 static int v = 27;
 static int k = 6;
 static int m = 4;
 static int t = 3;
 static int limit = 86;
 static int fixFirst = 1;
+static int threads = 1;
 static char resultFileName[256] = "exact_solution.txt";
 
 static mask_t *blocks = NULL;
 static mask_t *draws = NULL;
+static int *blockPoints = NULL;
+static int *blockOutside = NULL;
 static int blockCount = 0;
 static int drawCount = 0;
 static MaskMap blockMap;
 static MaskMap drawMap;
 
-static uint64_t **uncoveredStack = NULL;
 static int bitsetWords = 0;
-static int *solution = NULL;
 static int maxCover = 0;
 static int foundDepth = -1;
+static int *bestSolution = NULL;
 
-static int *stamp = NULL;
-static int stampValue = 1;
-static uint64_t nodesVisited = 0;
-static uint64_t *depthNodes = NULL;
-static uint64_t *depthCandidates = NULL;
+static atomic_uint_fast64_t nodesVisited;
+static atomic_uint_fast64_t *depthNodes = NULL;
+static atomic_uint_fast64_t *depthCandidates = NULL;
+static atomic_int foundFlag;
+static pthread_mutex_t solutionMutex = PTHREAD_MUTEX_INITIALIZER;
 static time_t startTime = 0;
 static time_t lastReport = 0;
 static int reportInterval = 5;
+
+static void free_context(SearchContext *ctx);
 
 static void format_duration(double seconds, char *buf, size_t size)
 {
@@ -72,6 +86,7 @@ static void report_progress(int depth, int remaining, int candCount)
   char elapsedBuf[32];
   char etaBuf[32];
   int i;
+  uint64_t visited = atomic_load(&nodesVisited);
 
   if(startTime == 0)
     startTime = now;
@@ -80,7 +95,7 @@ static void report_progress(int depth, int remaining, int candCount)
   lastReport = now;
 
   elapsed = difftime(now, startTime);
-  rate = elapsed > 0.0 ? (double) nodesVisited / elapsed : 0.0;
+  rate = elapsed > 0.0 ? (double) visited / elapsed : 0.0;
   minSteps = (remaining + maxCover - 1) / maxCover;
   if(minSteps < 0)
     minSteps = 0;
@@ -88,8 +103,9 @@ static void report_progress(int depth, int remaining, int candCount)
     for(i = 0; i < minSteps && depth + i <= limit; i++) {
       int d = depth + i;
       double avg = 1.0;
-      if(depthNodes && depthNodes[d] > 0)
-        avg = (double) depthCandidates[d] / (double) depthNodes[d];
+      if(depthNodes && atomic_load(&depthNodes[d]) > 0)
+        avg = (double) atomic_load(&depthCandidates[d]) /
+              (double) atomic_load(&depthNodes[d]);
       else if(candCount > 0)
         avg = (double) candCount;
       if(avg < 1.0)
@@ -109,7 +125,7 @@ static void report_progress(int depth, int remaining, int candCount)
     snprintf(etaBuf, sizeof(etaBuf), "unknown");
 
   printf("Progress: depth=%d/%d remaining=%d nodes=%" PRIu64 " rate=%.2f/s elapsed=%s ETA~%s\n",
-         depth, limit, remaining, nodesVisited, rate, elapsedBuf, etaBuf);
+         depth, limit, remaining, visited, rate, elapsedBuf, etaBuf);
   fflush(stdout);
 }
 
@@ -241,6 +257,33 @@ static void build_draws(void)
   free(comb);
 }
 
+static void build_block_points(void)
+{
+  int i;
+  int insideCount = k;
+  int outsideCount = v - k;
+
+  blockPoints = (int *) malloc(sizeof(int) * blockCount * insideCount);
+  blockOutside = (int *) malloc(sizeof(int) * blockCount * outsideCount);
+  if(!blockPoints || !blockOutside) {
+    fprintf(stderr, "ERROR: out of memory for block points\n");
+    exit(1);
+  }
+
+  for(i = 0; i < blockCount; i++) {
+    mask_t block = blocks[i];
+    int insideIndex = 0;
+    int outsideIndex = 0;
+    int p;
+    for(p = 0; p < v; p++) {
+      if(block & ((mask_t) 1u << p))
+        blockPoints[i * insideCount + insideIndex++] = p;
+      else
+        blockOutside[i * outsideCount + outsideIndex++] = p;
+    }
+  }
+}
+
 static int bitset_is_set(const uint64_t *bits, int idx)
 {
   return (bits[idx / 64] >> (idx % 64)) & 1u;
@@ -260,37 +303,21 @@ static int count_uncovered(const uint64_t *bits)
   return count;
 }
 
-static void block_points(mask_t block, int *pts, int *count)
+static int count_block_gain(int bindex, const uint64_t *uncovered)
 {
-  int i;
-  int idx = 0;
-  for(i = 0; i < v; i++) {
-    if(block & ((mask_t) 1u << i))
-      pts[idx++] = i;
-  }
-  *count = idx;
-}
-
-static int count_block_gain(mask_t block, const uint64_t *uncovered)
-{
-  int pts[32];
-  int ptCount = 0;
   int gain = 0;
   int i, j, kidx;
-  int outside[32];
-  int outCount = 0;
+  int l;
+  int o;
+  int insideCount = k;
+  int outsideCount = v - k;
+  const int *pts = blockPoints + bindex * insideCount;
+  const int *outside = blockOutside + bindex * outsideCount;
 
-  block_points(block, pts, &ptCount);
-  for(i = 0; i < v; i++) {
-    if(!(block & ((mask_t) 1u << i)))
-      outside[outCount++] = i;
-  }
-
-  for(i = 0; i < ptCount - 3; i++) {
-    for(j = i + 1; j < ptCount - 2; j++) {
-      for(kidx = j + 1; kidx < ptCount - 1; kidx++) {
-        int l;
-        for(l = kidx + 1; l < ptCount; l++) {
+  for(i = 0; i < insideCount - 3; i++) {
+    for(j = i + 1; j < insideCount - 2; j++) {
+      for(kidx = j + 1; kidx < insideCount - 1; kidx++) {
+        for(l = kidx + 1; l < insideCount; l++) {
           mask_t dmask = ((mask_t) 1u << pts[i]) |
                          ((mask_t) 1u << pts[j]) |
                          ((mask_t) 1u << pts[kidx]) |
@@ -303,11 +330,10 @@ static int count_block_gain(mask_t block, const uint64_t *uncovered)
     }
   }
 
-  for(i = 0; i < ptCount - 2; i++) {
-    for(j = i + 1; j < ptCount - 1; j++) {
-      for(kidx = j + 1; kidx < ptCount; kidx++) {
-        int o;
-        for(o = 0; o < outCount; o++) {
+  for(i = 0; i < insideCount - 2; i++) {
+    for(j = i + 1; j < insideCount - 1; j++) {
+      for(kidx = j + 1; kidx < insideCount; kidx++) {
+        for(o = 0; o < outsideCount; o++) {
           mask_t dmask = ((mask_t) 1u << pts[i]) |
                          ((mask_t) 1u << pts[j]) |
                          ((mask_t) 1u << pts[kidx]) |
@@ -322,25 +348,20 @@ static int count_block_gain(mask_t block, const uint64_t *uncovered)
   return gain;
 }
 
-static void apply_block(mask_t block, uint64_t *uncovered)
+static void apply_block(int bindex, uint64_t *uncovered)
 {
-  int pts[32];
-  int ptCount = 0;
   int i, j, kidx;
-  int outside[32];
-  int outCount = 0;
+  int l;
+  int o;
+  int insideCount = k;
+  int outsideCount = v - k;
+  const int *pts = blockPoints + bindex * insideCount;
+  const int *outside = blockOutside + bindex * outsideCount;
 
-  block_points(block, pts, &ptCount);
-  for(i = 0; i < v; i++) {
-    if(!(block & ((mask_t) 1u << i)))
-      outside[outCount++] = i;
-  }
-
-  for(i = 0; i < ptCount - 3; i++) {
-    for(j = i + 1; j < ptCount - 2; j++) {
-      for(kidx = j + 1; kidx < ptCount - 1; kidx++) {
-        int l;
-        for(l = kidx + 1; l < ptCount; l++) {
+  for(i = 0; i < insideCount - 3; i++) {
+    for(j = i + 1; j < insideCount - 2; j++) {
+      for(kidx = j + 1; kidx < insideCount - 1; kidx++) {
+        for(l = kidx + 1; l < insideCount; l++) {
           mask_t dmask = ((mask_t) 1u << pts[i]) |
                          ((mask_t) 1u << pts[j]) |
                          ((mask_t) 1u << pts[kidx]) |
@@ -353,11 +374,10 @@ static void apply_block(mask_t block, uint64_t *uncovered)
     }
   }
 
-  for(i = 0; i < ptCount - 2; i++) {
-    for(j = i + 1; j < ptCount - 1; j++) {
-      for(kidx = j + 1; kidx < ptCount; kidx++) {
-        int o;
-        for(o = 0; o < outCount; o++) {
+  for(i = 0; i < insideCount - 2; i++) {
+    for(j = i + 1; j < insideCount - 1; j++) {
+      for(kidx = j + 1; kidx < insideCount; kidx++) {
+        for(o = 0; o < outsideCount; o++) {
           mask_t dmask = ((mask_t) 1u << pts[i]) |
                          ((mask_t) 1u << pts[j]) |
                          ((mask_t) 1u << pts[kidx]) |
@@ -373,10 +393,13 @@ static void apply_block(mask_t block, uint64_t *uncovered)
 
 static int first_uncovered(const uint64_t *uncovered)
 {
-  int i;
-  for(i = 0; i < drawCount; i++) {
-    if(bitset_is_set(uncovered, i))
-      return i;
+  int word;
+  for(word = 0; word < bitsetWords; word++) {
+    uint64_t bits = uncovered[word];
+    if(bits) {
+      int offset = __builtin_ctzll(bits);
+      return word * 64 + offset;
+    }
   }
   return -1;
 }
@@ -390,7 +413,8 @@ static int candidate_compare(const void *a, const void *b)
   return ca->index - cb->index;
 }
 
-static int collect_candidates(mask_t drawMask, int lastBlockIndex, Candidate *candidates)
+static int collect_candidates(SearchContext *ctx, mask_t drawMask, int lastBlockIndex,
+                              Candidate *candidates)
 {
   int drawPts[4];
   int drawCountPts = 0;
@@ -402,11 +426,67 @@ static int collect_candidates(mask_t drawMask, int lastBlockIndex, Candidate *ca
       drawPts[drawCountPts++] = i;
   }
 
-  if(stampValue == INT32_MAX) {
-    memset(stamp, 0, sizeof(int) * blockCount);
-    stampValue = 1;
+  if(ctx->stampValue == INT32_MAX) {
+    memset(ctx->stamp, 0, sizeof(int) * blockCount);
+    ctx->stampValue = 1;
   }
-  stampValue++;
+  ctx->stampValue++;
+
+  for(i = 0; i < drawCountPts - 2; i++) {
+    for(j = i + 1; j < drawCountPts - 1; j++) {
+      for(kidx = j + 1; kidx < drawCountPts; kidx++) {
+        int rem[32];
+        int remCount = 0;
+        int r1, r2, r3;
+        mask_t tripleMask = ((mask_t) 1u << drawPts[i]) |
+                            ((mask_t) 1u << drawPts[j]) |
+                            ((mask_t) 1u << drawPts[kidx]);
+        int p;
+        for(p = 0; p < v; p++) {
+          if(!(tripleMask & ((mask_t) 1u << p)))
+            rem[remCount++] = p;
+        }
+        for(r1 = 0; r1 < remCount - 2; r1++) {
+          for(r2 = r1 + 1; r2 < remCount - 1; r2++) {
+            for(r3 = r2 + 1; r3 < remCount; r3++) {
+              mask_t bmask = tripleMask |
+                             ((mask_t) 1u << rem[r1]) |
+                             ((mask_t) 1u << rem[r2]) |
+                             ((mask_t) 1u << rem[r3]);
+              int bindex = map_get(&blockMap, bmask);
+            if(bindex < 0 || bindex <= lastBlockIndex)
+              continue;
+            if(ctx->stamp[bindex] != ctx->stampValue) {
+              ctx->stamp[bindex] = ctx->stampValue;
+              candidates[count++].index = bindex;
+            }
+          }
+        }
+        }
+      }
+    }
+  }
+  return count;
+}
+
+static int count_candidates_for_draw(SearchContext *ctx, mask_t drawMask, int lastBlockIndex,
+                                     int bestCount)
+{
+  int drawPts[4];
+  int drawCountPts = 0;
+  int i, j, kidx;
+  int count = 0;
+
+  for(i = 0; i < v; i++) {
+    if(drawMask & ((mask_t) 1u << i))
+      drawPts[drawCountPts++] = i;
+  }
+
+  if(ctx->stampValue == INT32_MAX) {
+    memset(ctx->stamp, 0, sizeof(int) * blockCount);
+    ctx->stampValue = 1;
+  }
+  ctx->stampValue++;
 
   for(i = 0; i < drawCountPts - 2; i++) {
     for(j = i + 1; j < drawCountPts - 1; j++) {
@@ -432,9 +512,11 @@ static int collect_candidates(mask_t drawMask, int lastBlockIndex, Candidate *ca
               int bindex = map_get(&blockMap, bmask);
               if(bindex < 0 || bindex <= lastBlockIndex)
                 continue;
-              if(stamp[bindex] != stampValue) {
-                stamp[bindex] = stampValue;
-                candidates[count++].index = bindex;
+              if(ctx->stamp[bindex] != ctx->stampValue) {
+                ctx->stamp[bindex] = ctx->stampValue;
+                count++;
+                if(bestCount > 0 && count >= bestCount)
+                  return count;
               }
             }
           }
@@ -445,18 +527,54 @@ static int collect_candidates(mask_t drawMask, int lastBlockIndex, Candidate *ca
   return count;
 }
 
-static int search(int depth, int lastBlockIndex)
+static int select_best_draw(SearchContext *ctx, const uint64_t *uncovered, int lastBlockIndex)
 {
-  uint64_t *uncovered = uncoveredStack[depth];
+  int word;
+  int bestIndex = -1;
+  int bestCount = INT_MAX;
+
+  for(word = 0; word < bitsetWords; word++) {
+    uint64_t bits = uncovered[word];
+    while(bits) {
+      int offset = __builtin_ctzll(bits);
+      int dindex = word * 64 + offset;
+      if(dindex < drawCount) {
+        int candCount = count_candidates_for_draw(ctx, draws[dindex], lastBlockIndex, bestCount);
+        if(candCount < bestCount) {
+          bestCount = candCount;
+          bestIndex = dindex;
+          if(bestCount <= 1)
+            return bestIndex;
+        }
+      }
+      bits &= bits - 1;
+    }
+  }
+  if(bestIndex < 0)
+    return first_uncovered(uncovered);
+  return bestIndex;
+}
+
+static int search(SearchContext *ctx, int depth, int lastBlockIndex)
+{
+  uint64_t *uncovered = ctx->uncoveredStack[depth];
   int remaining = count_uncovered(uncovered);
   int i;
 
-  nodesVisited++;
+  atomic_fetch_add(&nodesVisited, 1);
   if(depthNodes)
-    depthNodes[depth]++;
+    atomic_fetch_add(&depthNodes[depth], 1);
 
+  if(atomic_load(&foundFlag))
+    return 1;
   if(remaining == 0) {
-    foundDepth = depth;
+    pthread_mutex_lock(&solutionMutex);
+    if(!atomic_load(&foundFlag)) {
+      foundDepth = depth;
+      memcpy(bestSolution, ctx->solution, sizeof(int) * depth);
+      atomic_store(&foundFlag, 1);
+    }
+    pthread_mutex_unlock(&solutionMutex);
     return 1;
   }
   if(depth >= limit)
@@ -465,7 +583,7 @@ static int search(int depth, int lastBlockIndex)
     return 0;
 
   {
-    int dindex = first_uncovered(uncovered);
+    int dindex = select_best_draw(ctx, uncovered, lastBlockIndex);
     mask_t drawMask = draws[dindex];
     int maxCandidates = (int) (choose_u64(4, 3) * choose_u64(v - 3, 3));
     Candidate *candidates = (Candidate *) malloc(sizeof(Candidate) * maxCandidates);
@@ -475,26 +593,31 @@ static int search(int depth, int lastBlockIndex)
       fprintf(stderr, "ERROR: out of memory for candidates\n");
       exit(1);
     }
-    candCount = collect_candidates(drawMask, lastBlockIndex, candidates);
+    candCount = collect_candidates(ctx, drawMask, lastBlockIndex, candidates);
     if(candCount == 0) {
       free(candidates);
       return 0;
     }
     if(depthCandidates)
-      depthCandidates[depth] += (uint64_t) candCount;
-    report_progress(depth, remaining, candCount);
+      atomic_fetch_add(&depthCandidates[depth], (uint64_t) candCount);
+    if(ctx->report)
+      report_progress(depth, remaining, candCount);
     for(i = 0; i < candCount; i++) {
-      candidates[i].gain = count_block_gain(blocks[candidates[i].index], uncovered);
+      candidates[i].gain = count_block_gain(candidates[i].index, uncovered);
     }
     qsort(candidates, candCount, sizeof(Candidate), candidate_compare);
 
     for(i = 0; i < candCount; i++) {
       int bindex = candidates[i].index;
-      uint64_t *next = uncoveredStack[depth + 1];
+      uint64_t *next = ctx->uncoveredStack[depth + 1];
       memcpy(next, uncovered, sizeof(uint64_t) * bitsetWords);
-      apply_block(blocks[bindex], next);
-      solution[depth] = bindex;
-      if(search(depth + 1, bindex)) {
+      apply_block(bindex, next);
+      ctx->solution[depth] = bindex;
+      if(search(ctx, depth + 1, bindex)) {
+        free(candidates);
+        return 1;
+      }
+      if(atomic_load(&foundFlag)) {
         free(candidates);
         return 1;
       }
@@ -528,14 +651,14 @@ static void write_solution(int depth)
     return;
   }
   for(i = 0; i < depth; i++)
-    print_block(fp, blocks[solution[i]]);
+    print_block(fp, blocks[bestSolution[i]]);
   fclose(fp);
 }
 
 static void usage(const char *prog)
 {
   fprintf(stderr,
-          "Usage: %s [v=27 k=6 m=4 t=3 b=86 fixFirst=1 result=exact_solution.txt]\n",
+          "Usage: %s [v=27 k=6 m=4 t=3 b=86 fixFirst=1 threads=1 result=exact_solution.txt]\n",
           prog);
 }
 
@@ -555,6 +678,8 @@ static void parse_args(int argc, char **argv)
       continue;
     if(sscanf(argv[i], "fixFirst=%d", &fixFirst) == 1)
       continue;
+    if(sscanf(argv[i], "threads=%d", &threads) == 1)
+      continue;
     if(sscanf(argv[i], "result=%255s", resultFileName) == 1)
       continue;
     usage(argv[0]);
@@ -562,12 +687,101 @@ static void parse_args(int argc, char **argv)
   }
 }
 
+static SearchContext *create_context(void)
+{
+  SearchContext *ctx = (SearchContext *) calloc(1, sizeof(SearchContext));
+  int i;
+  if(!ctx)
+    return NULL;
+  ctx->uncoveredStack = (uint64_t **) malloc(sizeof(uint64_t *) * (limit + 1));
+  if(!ctx->uncoveredStack) {
+    free(ctx);
+    return NULL;
+  }
+  for(i = 0; i <= limit; i++) {
+    ctx->uncoveredStack[i] = (uint64_t *) malloc(sizeof(uint64_t) * bitsetWords);
+    if(!ctx->uncoveredStack[i]) {
+      int j;
+      for(j = 0; j < i; j++)
+        free(ctx->uncoveredStack[j]);
+      free(ctx->uncoveredStack);
+      free(ctx);
+      return NULL;
+    }
+  }
+  ctx->solution = (int *) malloc(sizeof(int) * limit);
+  ctx->stamp = (int *) calloc(blockCount, sizeof(int));
+  ctx->stampValue = 1;
+  if(!ctx->solution || !ctx->stamp) {
+    free_context(ctx);
+    return NULL;
+  }
+  return ctx;
+}
+
+static void free_context(SearchContext *ctx)
+{
+  int i;
+  if(!ctx)
+    return;
+  if(ctx->uncoveredStack) {
+    for(i = 0; i <= limit; i++)
+      free(ctx->uncoveredStack[i]);
+    free(ctx->uncoveredStack);
+  }
+  free(ctx->solution);
+  free(ctx->stamp);
+  free(ctx);
+}
+
+typedef struct {
+  SearchContext *ctx;
+  const uint64_t *base;
+  const int *baseSolution;
+  int baseDepth;
+  Candidate *candidates;
+  int candCount;
+  atomic_int *nextIndex;
+} ThreadWork;
+
+static void *search_worker(void *arg)
+{
+  ThreadWork *work = (ThreadWork *) arg;
+  SearchContext *ctx = work->ctx;
+  int idx;
+
+  if(work->baseDepth > 0)
+    memcpy(ctx->solution, work->baseSolution, sizeof(int) * work->baseDepth);
+
+  while((idx = atomic_fetch_add(work->nextIndex, 1)) < work->candCount) {
+    int bindex = work->candidates[idx].index;
+    uint64_t *start = ctx->uncoveredStack[work->baseDepth];
+    uint64_t *next = ctx->uncoveredStack[work->baseDepth + 1];
+
+    if(atomic_load(&foundFlag))
+      break;
+
+    memcpy(start, work->base, sizeof(uint64_t) * bitsetWords);
+    memcpy(next, start, sizeof(uint64_t) * bitsetWords);
+    apply_block(bindex, next);
+    ctx->solution[work->baseDepth] = bindex;
+    search(ctx, work->baseDepth + 1, bindex);
+    if(atomic_load(&foundFlag))
+      break;
+  }
+  return NULL;
+}
+
 int main(int argc, char **argv)
 {
   int i;
   int depth = 0;
+  int threadCount;
   mask_t firstMask = 0;
   uint64_t *base;
+  uint64_t *baseUncovered;
+  int *baseSolution;
+  SearchContext *mainCtx = NULL;
 
   parse_args(argc, argv);
 
@@ -582,6 +796,7 @@ int main(int argc, char **argv)
 
   build_blocks();
   build_draws();
+  build_block_points();
 
   map_init(&blockMap, blockCount);
   for(i = 0; i < blockCount; i++)
@@ -592,48 +807,49 @@ int main(int argc, char **argv)
     map_put(&drawMap, draws[i], i);
 
   bitsetWords = (drawCount + 63) / 64;
-  uncoveredStack = (uint64_t **) malloc(sizeof(uint64_t *) * (limit + 1));
-  if(!uncoveredStack) {
+  mainCtx = create_context();
+  if(!mainCtx) {
     fprintf(stderr, "ERROR: out of memory for bitsets\n");
     return 1;
   }
-  for(i = 0; i <= limit; i++) {
-    uncoveredStack[i] = (uint64_t *) malloc(sizeof(uint64_t) * bitsetWords);
-    if(!uncoveredStack[i]) {
-      fprintf(stderr, "ERROR: out of memory for bitsets\n");
-      return 1;
-    }
-  }
 
-  base = uncoveredStack[0];
+  base = mainCtx->uncoveredStack[0];
   for(i = 0; i < bitsetWords; i++)
     base[i] = ~0ull;
   if(drawCount % 64)
     base[bitsetWords - 1] &= (1ull << (drawCount % 64)) - 1;
 
-  solution = (int *) malloc(sizeof(int) * limit);
-  stamp = (int *) calloc(blockCount, sizeof(int));
-  depthNodes = (uint64_t *) calloc(limit + 1, sizeof(uint64_t));
-  depthCandidates = (uint64_t *) calloc(limit + 1, sizeof(uint64_t));
-  if(!solution || !stamp || !depthNodes || !depthCandidates) {
-    fprintf(stderr, "ERROR: out of memory for solution/stamp\n");
+  bestSolution = (int *) malloc(sizeof(int) * limit);
+  baseSolution = (int *) calloc(limit, sizeof(int));
+  depthNodes = (atomic_uint_fast64_t *) calloc(limit + 1, sizeof(atomic_uint_fast64_t));
+  depthCandidates = (atomic_uint_fast64_t *) calloc(limit + 1, sizeof(atomic_uint_fast64_t));
+  if(!bestSolution || !baseSolution || !depthNodes || !depthCandidates) {
+    fprintf(stderr, "ERROR: out of memory for solution/stats\n");
     return 1;
   }
+  for(i = 0; i <= limit; i++) {
+    atomic_init(&depthNodes[i], 0);
+    atomic_init(&depthCandidates[i], 0);
+  }
+  atomic_init(&nodesVisited, 0);
+  atomic_init(&foundFlag, 0);
 
   maxCover = (int) (choose_u64(k, 4) + choose_u64(k, 3) * (v - k));
 
   if(fixFirst) {
     for(i = 0; i < k; i++)
       firstMask |= (mask_t) 1u << i;
-    solution[0] = map_get(&blockMap, firstMask);
-    if(solution[0] < 0) {
+    baseSolution[0] = map_get(&blockMap, firstMask);
+    if(baseSolution[0] < 0) {
       fprintf(stderr, "ERROR: failed to find fixed first block\n");
       return 1;
     }
-    memcpy(uncoveredStack[1], base, sizeof(uint64_t) * bitsetWords);
-    apply_block(firstMask, uncoveredStack[1]);
+    memcpy(mainCtx->uncoveredStack[1], base, sizeof(uint64_t) * bitsetWords);
+    apply_block(baseSolution[0], mainCtx->uncoveredStack[1]);
     depth = 1;
   }
+  baseUncovered = mainCtx->uncoveredStack[depth];
+  mainCtx->report = 1;
 
   startTime = time(NULL);
   lastReport = 0;
@@ -641,12 +857,97 @@ int main(int argc, char **argv)
          v, k, m, t, limit, blockCount, drawCount);
   fflush(stdout);
 
-  if(search(depth, depth ? solution[depth - 1] : -1)) {
-    printf("Found solution with %d blocks. Writing to %s\n", foundDepth, resultFileName);
-    write_solution(foundDepth);
-    return 0;
+  if(threads < 1)
+    threads = 1;
+
+  if(threads == 1) {
+    if(depth > 0)
+      memcpy(mainCtx->solution, baseSolution, sizeof(int) * depth);
+    if(search(mainCtx, depth, depth ? baseSolution[depth - 1] : -1)) {
+      printf("Found solution with %d blocks. Writing to %s\n", foundDepth, resultFileName);
+      write_solution(foundDepth);
+      free_context(mainCtx);
+      free(baseSolution);
+      return 0;
+    }
+  } else {
+    int dindex = select_best_draw(mainCtx, baseUncovered, depth ? baseSolution[depth - 1] : -1);
+    mask_t drawMask = draws[dindex];
+    int maxCandidates = (int) (choose_u64(4, 3) * choose_u64(v - 3, 3));
+    Candidate *candidates = (Candidate *) malloc(sizeof(Candidate) * maxCandidates);
+    int candCount;
+    pthread_t *threadIds;
+    SearchContext **contexts;
+    ThreadWork *workItems;
+    atomic_int nextIndex;
+
+    if(!candidates) {
+      fprintf(stderr, "ERROR: out of memory for candidates\n");
+      return 1;
+    }
+
+    candCount = collect_candidates(mainCtx, drawMask, depth ? baseSolution[depth - 1] : -1,
+                                   candidates);
+    if(candCount == 0) {
+      free(candidates);
+      printf("No solution found with b <= %d\n", limit);
+      free_context(mainCtx);
+      free(baseSolution);
+      return 0;
+    }
+    for(i = 0; i < candCount; i++)
+      candidates[i].gain = count_block_gain(candidates[i].index, baseUncovered);
+    qsort(candidates, candCount, sizeof(Candidate), candidate_compare);
+
+    threadCount = threads < candCount ? threads : candCount;
+    threadIds = (pthread_t *) malloc(sizeof(pthread_t) * threadCount);
+    contexts = (SearchContext **) malloc(sizeof(SearchContext *) * threadCount);
+    workItems = (ThreadWork *) malloc(sizeof(ThreadWork) * threadCount);
+    if(!threadIds || !contexts || !workItems) {
+      fprintf(stderr, "ERROR: out of memory for threads\n");
+      return 1;
+    }
+
+    atomic_init(&nextIndex, 0);
+    for(i = 0; i < threadCount; i++) {
+      contexts[i] = create_context();
+      if(!contexts[i]) {
+        fprintf(stderr, "ERROR: out of memory for thread context\n");
+        return 1;
+      }
+      contexts[i]->report = (i == 0);
+      workItems[i].ctx = contexts[i];
+      workItems[i].base = baseUncovered;
+      workItems[i].baseSolution = baseSolution;
+      workItems[i].baseDepth = depth;
+      workItems[i].candidates = candidates;
+      workItems[i].candCount = candCount;
+      workItems[i].nextIndex = &nextIndex;
+      pthread_create(&threadIds[i], NULL, search_worker, &workItems[i]);
+    }
+
+    for(i = 0; i < threadCount; i++)
+      pthread_join(threadIds[i], NULL);
+
+    for(i = 0; i < threadCount; i++)
+      free_context(contexts[i]);
+
+    free(contexts);
+    free(workItems);
+    free(threadIds);
+    free(candidates);
+
+    if(atomic_load(&foundFlag)) {
+      printf("Found solution with %d blocks. Writing to %s\n", foundDepth, resultFileName);
+      write_solution(foundDepth);
+      free_context(mainCtx);
+      free(baseSolution);
+      return 0;
+    }
   }
 
   printf("No solution found with b <= %d\n", limit);
+  free_context(mainCtx);
+  free(baseSolution);
   return 0;
 }

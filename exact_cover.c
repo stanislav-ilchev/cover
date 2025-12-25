@@ -26,6 +26,7 @@ typedef struct {
   int *solution;
   int *stamp;
   int stampValue;
+  Candidate *candidateStack;
   int report;
 } SearchContext;
 
@@ -51,6 +52,7 @@ static int bitsetWords = 0;
 static int maxCover = 0;
 static int foundDepth = -1;
 static int *bestSolution = NULL;
+static int candidateCapacity = 0;
 
 static atomic_uint_fast64_t nodesVisited;
 static atomic_uint_fast64_t *depthNodes = NULL;
@@ -585,19 +587,12 @@ static int search(SearchContext *ctx, int depth, int lastBlockIndex)
   {
     int dindex = select_best_draw(ctx, uncovered, lastBlockIndex);
     mask_t drawMask = draws[dindex];
-    int maxCandidates = (int) (choose_u64(4, 3) * choose_u64(v - 3, 3));
-    Candidate *candidates = (Candidate *) malloc(sizeof(Candidate) * maxCandidates);
+    Candidate *candidates = ctx->candidateStack + (size_t) depth * candidateCapacity;
     int candCount;
 
-    if(!candidates) {
-      fprintf(stderr, "ERROR: out of memory for candidates\n");
-      exit(1);
-    }
     candCount = collect_candidates(ctx, drawMask, lastBlockIndex, candidates);
-    if(candCount == 0) {
-      free(candidates);
+    if(candCount == 0)
       return 0;
-    }
     if(depthCandidates)
       atomic_fetch_add(&depthCandidates[depth], (uint64_t) candCount);
     if(ctx->report)
@@ -614,15 +609,11 @@ static int search(SearchContext *ctx, int depth, int lastBlockIndex)
       apply_block(bindex, next);
       ctx->solution[depth] = bindex;
       if(search(ctx, depth + 1, bindex)) {
-        free(candidates);
         return 1;
       }
-      if(atomic_load(&foundFlag)) {
-        free(candidates);
+      if(atomic_load(&foundFlag))
         return 1;
-      }
     }
-    free(candidates);
   }
   return 0;
 }
@@ -712,7 +703,9 @@ static SearchContext *create_context(void)
   ctx->solution = (int *) malloc(sizeof(int) * limit);
   ctx->stamp = (int *) calloc(blockCount, sizeof(int));
   ctx->stampValue = 1;
-  if(!ctx->solution || !ctx->stamp) {
+  ctx->candidateStack =
+    (Candidate *) malloc(sizeof(Candidate) * (size_t) (limit + 1) * candidateCapacity);
+  if(!ctx->solution || !ctx->stamp || !ctx->candidateStack) {
     free_context(ctx);
     return NULL;
   }
@@ -731,6 +724,7 @@ static void free_context(SearchContext *ctx)
   }
   free(ctx->solution);
   free(ctx->stamp);
+  free(ctx->candidateStack);
   free(ctx);
 }
 
@@ -807,6 +801,7 @@ int main(int argc, char **argv)
     map_put(&drawMap, draws[i], i);
 
   bitsetWords = (drawCount + 63) / 64;
+  candidateCapacity = (int) (choose_u64(4, 3) * choose_u64(v - 3, 3));
   mainCtx = create_context();
   if(!mainCtx) {
     fprintf(stderr, "ERROR: out of memory for bitsets\n");

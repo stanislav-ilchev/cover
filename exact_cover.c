@@ -776,6 +776,7 @@ static int sat_solve(void)
 {
   size_t auxCount = 0;
   size_t clauseCount = 0;
+  int applyLimit = !satNoLimit;
   int i;
   int hasEmptyClause = 0;
   int atMostClauses = 0;
@@ -788,6 +789,18 @@ static int sat_solve(void)
     return -1;
   }
 
+  if(limit >= blockCount)
+    applyLimit = 0;
+
+  if(applyLimit)
+    auxCount = sat_aux_count(blockCount, limit);
+  if(applyLimit && auxCount > satMaxAux) {
+    fprintf(stderr,
+            "WARNING: SAT auxiliary variable count %zu exceeds sat_max_aux=%zu; "
+            "continuing without b-limit encoding (set sat_no_limit=1 to silence).\n",
+            auxCount, satMaxAux);
+    applyLimit = 0;
+    auxCount = 0;
   if(!satNoLimit && limit < blockCount)
     auxCount = sat_aux_count(blockCount, limit);
   if(auxCount > satMaxAux) {
@@ -799,6 +812,7 @@ static int sat_solve(void)
   clauseCount = (size_t) drawCount;
   if(fixedBlockIndex >= 0)
     clauseCount += 1;
+  if(applyLimit && limit < blockCount)
   if(!satNoLimit && limit < blockCount)
     atMostClauses = sat_at_most_clause_count(blockCount, limit);
   clauseCount += (size_t) atMostClauses;
@@ -818,6 +832,7 @@ static int sat_solve(void)
       hasEmptyClause = 1;
   }
 
+  if(applyLimit && limit < blockCount)
   if(!satNoLimit && limit < blockCount)
     sat_emit_at_most(fp, blockCount, limit, 1);
 
@@ -844,6 +859,7 @@ static int sat_solve(void)
     int count = 0;
     for(i = 1; i <= blockCount; i++) {
       if(model[i] > 0) {
+        if(count < limit || !applyLimit)
         if(count < limit || satNoLimit)
           bestSolution[count++] = i - 1;
       }

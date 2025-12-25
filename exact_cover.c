@@ -32,7 +32,8 @@ typedef struct {
 
 typedef enum {
   SEARCH_DFS = 0,
-  SEARCH_DLX = 1
+  SEARCH_DLX = 1,
+  SEARCH_SAT = 2
 } SearchAlgo;
 
 typedef struct {
@@ -66,6 +67,10 @@ static int fixFirst = 1;
 static int threads = 1;
 static SearchAlgo algo = SEARCH_DFS;
 static char resultFileName[256] = "exact_solution.txt";
+static char satCnfFileName[256] = "exact_cover.cnf";
+static char satSolverCmd[512] = "";
+static int satNoLimit = 0;
+static size_t satMaxAux = 5000000;
 
 static mask_t *blocks = NULL;
 static mask_t *draws = NULL;
@@ -80,6 +85,7 @@ static int bitsetWords = 0;
 static int maxCover = 0;
 static int foundDepth = -1;
 static int *bestSolution = NULL;
+static int fixedBlockIndex = -1;
 static int candidateCapacity = 0;
 static DlxMatrix dlx = {0};
 
@@ -93,6 +99,8 @@ static time_t lastReport = 0;
 static int reportInterval = 5;
 
 static void free_context(SearchContext *ctx);
+static int sat_solve(void);
+static const char *algo_name(SearchAlgo algo);
 
 static void format_duration(double seconds, char *buf, size_t size)
 {
@@ -158,6 +166,20 @@ static void report_progress(int depth, int remaining, int candCount)
   printf("Progress: depth=%d/%d remaining=%d nodes=%" PRIu64 " rate=%.2f/s elapsed=%s ETA~%s\n",
          depth, limit, remaining, visited, rate, elapsedBuf, etaBuf);
   fflush(stdout);
+}
+
+static const char *algo_name(SearchAlgo algo)
+{
+  switch(algo) {
+  case SEARCH_DFS:
+    return "dfs";
+  case SEARCH_DLX:
+    return "dlx";
+  case SEARCH_SAT:
+    return "sat";
+  default:
+    return "unknown";
+  }
 }
 
 static uint64_t choose_u64(int n, int r)
@@ -522,6 +544,315 @@ static void build_dlx_matrix(void)
     }
     dlx.rowHead[bindex] = first;
   }
+}
+
+static int emit_draw_clause(FILE *fp, mask_t drawMask, int emit)
+{
+  int remPts[32];
+  int remCount = 0;
+  int p;
+  int r = k - m;
+  int count = 0;
+
+  for(p = 0; p < v; p++) {
+    if(!(drawMask & ((mask_t) 1u << p)))
+      remPts[remCount++] = p;
+  }
+
+  if(r < 0 || remCount < r)
+    return 0;
+
+  if(r == 0) {
+    int bindex = map_get(&blockMap, drawMask);
+    if(bindex >= 0) {
+      if(emit)
+        fprintf(fp, "%d ", bindex + 1);
+      count++;
+    }
+  } else {
+    int comb[32];
+    int i;
+    for(i = 0; i < r; i++)
+      comb[i] = i;
+    do {
+      mask_t bmask = drawMask;
+      int j;
+      for(j = 0; j < r; j++)
+        bmask |= (mask_t) 1u << remPts[comb[j]];
+      int bindex = map_get(&blockMap, bmask);
+      if(bindex >= 0) {
+        if(emit)
+          fprintf(fp, "%d ", bindex + 1);
+        count++;
+      }
+    } while(next_combination(comb, r, remCount));
+  }
+
+  if(emit)
+    fprintf(fp, "0\n");
+  return count;
+}
+
+static size_t sat_aux_count(int n, int k)
+{
+  if(k <= 0 || k >= n)
+    return 0;
+  return (size_t) n * (size_t) k;
+}
+
+static size_t sat_at_most_clause_count(int n, int k)
+{
+  size_t n1;
+  size_t k1;
+  if(k >= n)
+    return 0;
+  if(k <= 0)
+    return (size_t) n;
+  n1 = (size_t) (n - 1);
+  k1 = (size_t) (k - 1);
+  return 1 + 3 * n1 + 2 * n1 * k1;
+}
+
+static int sat_emit_at_most(FILE *fp, int n, int k, int emit)
+{
+  int clauses = 0;
+  int i;
+  if(k >= n)
+    return 0;
+  if(k <= 0) {
+    for(i = 1; i <= n; i++) {
+      if(emit)
+        fprintf(fp, "-%d 0\n", i);
+      clauses++;
+    }
+    return clauses;
+  }
+
+  if(emit)
+    fprintf(fp, "-1 %d 0\n", blockCount + 1);
+  clauses++;
+
+  for(i = 2; i <= n; i++) {
+    int s_i1 = blockCount + (i - 1) * k + 1;
+    int s_prev1 = blockCount + (i - 2) * k + 1;
+    if(emit)
+      fprintf(fp, "-%d %d 0\n", i, s_i1);
+    clauses++;
+    if(emit)
+      fprintf(fp, "-%d %d 0\n", s_prev1, s_i1);
+    clauses++;
+  }
+
+  for(i = 2; i <= n; i++) {
+    int j;
+    for(j = 2; j <= k; j++) {
+      int s_i_j = blockCount + (i - 1) * k + j;
+      int s_prev_j = blockCount + (i - 2) * k + j;
+      int s_prev_jm1 = blockCount + (i - 2) * k + (j - 1);
+      if(emit)
+        fprintf(fp, "-%d -%d %d 0\n", i, s_prev_jm1, s_i_j);
+      clauses++;
+      if(emit)
+        fprintf(fp, "-%d %d 0\n", s_prev_j, s_i_j);
+      clauses++;
+    }
+  }
+
+  for(i = 2; i <= n; i++) {
+    int s_prev_k = blockCount + (i - 2) * k + k;
+    if(emit)
+      fprintf(fp, "-%d -%d 0\n", i, s_prev_k);
+    clauses++;
+  }
+  return clauses;
+}
+
+static int parse_sat_stream(FILE *fp, int *model, int modelSize)
+{
+  char line[4096];
+  int status = -1;
+  while(fgets(line, sizeof(line), fp)) {
+    if(strstr(line, "UNSAT") != NULL)
+      status = 0;
+    else if(strstr(line, "SAT") != NULL)
+      status = 1;
+    {
+      char *ptr = line;
+      while(*ptr) {
+        char *end = NULL;
+        long val = strtol(ptr, &end, 10);
+        int sign = 1;
+        if(end == ptr) {
+          ptr++;
+          continue;
+        }
+        if(val == 0)
+          break;
+        if(val < 0) {
+          sign = -1;
+          val = -val;
+        }
+        if(val <= modelSize)
+          model[val] = sign;
+        ptr = end;
+      }
+    }
+  }
+  return status;
+}
+
+static int build_solver_command(char *out, size_t outSize, const char *cmd,
+                                const char *cnfFile, const char *outFile)
+{
+  size_t used = 0;
+  int hasInput = 0;
+  int hasOutput = 0;
+  const char *p;
+
+  for(p = cmd; *p; p++) {
+    if(p[0] == '%' && p[1] == 's') {
+      hasInput = 1;
+      used += snprintf(out + used, outSize - used, "%s", cnfFile);
+      p++;
+      continue;
+    }
+    if(p[0] == '%' && p[1] == 'o') {
+      hasOutput = 1;
+      used += snprintf(out + used, outSize - used, "%s", outFile);
+      p++;
+      continue;
+    }
+    if(used + 2 < outSize) {
+      out[used++] = *p;
+      out[used] = '\0';
+    }
+  }
+
+  if(!hasInput) {
+    used += snprintf(out + used, outSize - used, " %s", cnfFile);
+  }
+
+  return hasOutput;
+}
+
+static int sat_run_solver(const char *cnfFile, int *model, int modelSize)
+{
+  char cmd[1024];
+  char outFile[512];
+  int hasOutput;
+  int status = -1;
+
+  snprintf(outFile, sizeof(outFile), "%s.out", cnfFile);
+  hasOutput = build_solver_command(cmd, sizeof(cmd), satSolverCmd, cnfFile, outFile);
+
+  if(hasOutput) {
+    int sysStatus = system(cmd);
+    FILE *fp;
+    if(sysStatus != 0) {
+      fprintf(stderr, "ERROR: SAT solver exited with status %d\n", sysStatus);
+      return -1;
+    }
+    fp = fopen(outFile, "r");
+    if(!fp) {
+      fprintf(stderr, "ERROR: failed to open SAT solver output %s\n", outFile);
+      return -1;
+    }
+    status = parse_sat_stream(fp, model, modelSize);
+    fclose(fp);
+  } else {
+    FILE *fp = popen(cmd, "r");
+    if(!fp) {
+      fprintf(stderr, "ERROR: failed to run SAT solver command\n");
+      return -1;
+    }
+    status = parse_sat_stream(fp, model, modelSize);
+    pclose(fp);
+  }
+
+  return status;
+}
+
+static int sat_solve(void)
+{
+  size_t auxCount = 0;
+  size_t clauseCount = 0;
+  int i;
+  int hasEmptyClause = 0;
+  int atMostClauses = 0;
+  FILE *fp;
+  int status;
+  int *model;
+
+  if(k < m) {
+    fprintf(stderr, "ERROR: SAT encoding requires k >= m\n");
+    return -1;
+  }
+
+  if(!satNoLimit && limit < blockCount)
+    auxCount = sat_aux_count(blockCount, limit);
+  if(auxCount > satMaxAux) {
+    fprintf(stderr, "ERROR: SAT auxiliary variable count %zu exceeds sat_max_aux=%zu\n",
+            auxCount, satMaxAux);
+    return -1;
+  }
+
+  clauseCount = (size_t) drawCount;
+  if(fixedBlockIndex >= 0)
+    clauseCount += 1;
+  if(!satNoLimit && limit < blockCount)
+    atMostClauses = sat_at_most_clause_count(blockCount, limit);
+  clauseCount += (size_t) atMostClauses;
+
+  fp = fopen(satCnfFileName, "w");
+  if(!fp) {
+    fprintf(stderr, "ERROR: could not write SAT CNF to %s\n", satCnfFileName);
+    return -1;
+  }
+
+  fprintf(fp, "p cnf %d %zu\n", (int) (blockCount + auxCount), clauseCount);
+  if(fixedBlockIndex >= 0)
+    fprintf(fp, "%d 0\n", fixedBlockIndex + 1);
+
+  for(i = 0; i < drawCount; i++) {
+    if(emit_draw_clause(fp, draws[i], 1) == 0)
+      hasEmptyClause = 1;
+  }
+
+  if(!satNoLimit && limit < blockCount)
+    sat_emit_at_most(fp, blockCount, limit, 1);
+
+  fclose(fp);
+
+  if(hasEmptyClause) {
+    printf("SAT encoding produced an empty clause; instance is unsatisfiable.\n");
+    return 0;
+  }
+
+  if(satSolverCmd[0] == '\0') {
+    printf("Wrote SAT CNF to %s (set sat_solver=... to solve).\n", satCnfFileName);
+    return -2;
+  }
+
+  model = (int *) calloc((size_t) blockCount + 1, sizeof(int));
+  if(!model) {
+    fprintf(stderr, "ERROR: out of memory for SAT model\n");
+    return -1;
+  }
+
+  status = sat_run_solver(satCnfFileName, model, blockCount);
+  if(status == 1) {
+    int count = 0;
+    for(i = 1; i <= blockCount; i++) {
+      if(model[i] > 0) {
+        if(count < limit || satNoLimit)
+          bestSolution[count++] = i - 1;
+      }
+    }
+    foundDepth = count;
+  }
+
+  free(model);
+  return status;
 }
 
 static int bitset_is_set(const uint64_t *bits, int idx)
@@ -941,7 +1272,8 @@ static void write_solution(int depth)
 static void usage(const char *prog)
 {
   fprintf(stderr,
-          "Usage: %s [v=27 k=6 m=4 t=3 b=86 fixFirst=1 threads=1 algo=dfs result=exact_solution.txt]\n",
+          "Usage: %s [v=27 k=6 m=4 t=3 b=86 fixFirst=1 threads=1 algo=dfs result=exact_solution.txt "
+          "sat_cnf=exact_cover.cnf sat_solver=CMD sat_no_limit=0 sat_max_aux=5000000]\n",
           prog);
 }
 
@@ -971,7 +1303,19 @@ static void parse_args(int argc, char **argv)
       algo = SEARCH_DLX;
       continue;
     }
+    if(strcmp(argv[i], "algo=sat") == 0) {
+      algo = SEARCH_SAT;
+      continue;
+    }
     if(sscanf(argv[i], "result=%255s", resultFileName) == 1)
+      continue;
+    if(sscanf(argv[i], "sat_cnf=%255s", satCnfFileName) == 1)
+      continue;
+    if(sscanf(argv[i], "sat_solver=%511s", satSolverCmd) == 1)
+      continue;
+    if(sscanf(argv[i], "sat_no_limit=%d", &satNoLimit) == 1)
+      continue;
+    if(sscanf(argv[i], "sat_max_aux=%zu", &satMaxAux) == 1)
       continue;
     usage(argv[0]);
     exit(1);
@@ -1117,7 +1461,7 @@ int main(int argc, char **argv)
       base[i] = ~0ull;
     if(drawCount % 64)
       base[bitsetWords - 1] &= (1ull << (drawCount % 64)) - 1;
-  } else {
+  } else if(algo == SEARCH_DLX) {
     build_dlx_matrix();
     dlxCtx.solution = (int *) malloc(sizeof(int) * limit);
     dlxCtx.rowUsed = (unsigned char *) calloc((size_t) blockCount, sizeof(unsigned char));
@@ -1150,11 +1494,12 @@ int main(int argc, char **argv)
       fprintf(stderr, "ERROR: failed to find fixed first block\n");
       return 1;
     }
+    fixedBlockIndex = baseSolution[0];
     if(algo == SEARCH_DFS) {
       memcpy(mainCtx->uncoveredStack[1], base, sizeof(uint64_t) * bitsetWords);
       apply_block(baseSolution[0], mainCtx->uncoveredStack[1]);
       depth = 1;
-    } else {
+    } else if(algo == SEARCH_DLX) {
       int removedCols[maxCover];
       int rowNode = dlx.rowHead[baseSolution[0]];
       if(rowNode < 0) {
@@ -1165,20 +1510,23 @@ int main(int argc, char **argv)
       dlxCtx.solution[0] = baseSolution[0];
       dlx_cover_row(&dlx, rowNode, removedCols, maxCover);
       depth = 1;
+    } else {
+      depth = 1;
     }
+  } else {
+    fixedBlockIndex = -1;
   }
   if(algo == SEARCH_DFS) {
     baseUncovered = mainCtx->uncoveredStack[depth];
     mainCtx->report = 1;
-  } else {
+  } else if(algo == SEARCH_DLX) {
     dlxCtx.report = 1;
   }
 
   startTime = time(NULL);
   lastReport = 0;
   printf("Starting exact cover search: v=%d k=%d m=%d t=%d b=%d blocks=%d draws=%d algo=%s\n",
-         v, k, m, t, limit, blockCount, drawCount,
-         algo == SEARCH_DLX ? "dlx" : "dfs");
+         v, k, m, t, limit, blockCount, drawCount, algo_name(algo));
   fflush(stdout);
 
   if(threads < 1)
@@ -1190,6 +1538,18 @@ int main(int argc, char **argv)
     if(depth > 0)
       memcpy(dlxCtx.solution, baseSolution, sizeof(int) * depth);
     dlx_search(&dlxCtx, depth, depth ? baseSolution[depth - 1] : -1);
+  } else if(algo == SEARCH_SAT) {
+    int satStatus = sat_solve();
+    if(satStatus == 1) {
+      printf("Found solution with %d blocks. Writing to %s\n", foundDepth, resultFileName);
+      write_solution(foundDepth);
+    } else if(satStatus == 0) {
+      printf("No solution found with b <= %d\n", limit);
+    } else if(satStatus == -2) {
+      /* CNF emitted, solver not run. */
+    } else {
+      fprintf(stderr, "ERROR: SAT solver failed\n");
+    }
   } else if(threads == 1) {
     if(depth > 0)
       memcpy(mainCtx->solution, baseSolution, sizeof(int) * depth);
@@ -1268,11 +1628,13 @@ int main(int argc, char **argv)
     free(candidates);
   }
 
-  if(atomic_load(&foundFlag)) {
-    printf("Found solution with %d blocks. Writing to %s\n", foundDepth, resultFileName);
-    write_solution(foundDepth);
-  } else {
-    printf("No solution found with b <= %d\n", limit);
+  if(algo != SEARCH_SAT) {
+    if(atomic_load(&foundFlag)) {
+      printf("Found solution with %d blocks. Writing to %s\n", foundDepth, resultFileName);
+      write_solution(foundDepth);
+    } else {
+      printf("No solution found with b <= %d\n", limit);
+    }
   }
   if(mainCtx)
     free_context(mainCtx);

@@ -3,6 +3,8 @@
 #include <stdint.h>
 #include <limits.h>
 #include <string.h>
+#include <time.h>
+#include <inttypes.h>
 
 typedef uint32_t mask_t;
 
@@ -40,6 +42,76 @@ static int foundDepth = -1;
 
 static int *stamp = NULL;
 static int stampValue = 1;
+static uint64_t nodesVisited = 0;
+static uint64_t *depthNodes = NULL;
+static uint64_t *depthCandidates = NULL;
+static time_t startTime = 0;
+static time_t lastReport = 0;
+static int reportInterval = 5;
+
+static void format_duration(double seconds, char *buf, size_t size)
+{
+  int total = (int) (seconds + 0.5);
+  int hours = total / 3600;
+  int minutes = (total % 3600) / 60;
+  int secs = total % 60;
+  if(hours > 0)
+    snprintf(buf, size, "%dh%02dm%02ds", hours, minutes, secs);
+  else
+    snprintf(buf, size, "%dm%02ds", minutes, secs);
+}
+
+static void report_progress(int depth, int remaining, int candCount)
+{
+  time_t now = time(NULL);
+  double elapsed;
+  double rate;
+  int minSteps;
+  double estimatedNodes = 1.0;
+  double etaSeconds = -1.0;
+  char elapsedBuf[32];
+  char etaBuf[32];
+  int i;
+
+  if(startTime == 0)
+    startTime = now;
+  if(lastReport != 0 && now - lastReport < reportInterval)
+    return;
+  lastReport = now;
+
+  elapsed = difftime(now, startTime);
+  rate = elapsed > 0.0 ? (double) nodesVisited / elapsed : 0.0;
+  minSteps = (remaining + maxCover - 1) / maxCover;
+  if(minSteps < 0)
+    minSteps = 0;
+  if(minSteps > 0) {
+    for(i = 0; i < minSteps && depth + i <= limit; i++) {
+      int d = depth + i;
+      double avg = 1.0;
+      if(depthNodes && depthNodes[d] > 0)
+        avg = (double) depthCandidates[d] / (double) depthNodes[d];
+      else if(candCount > 0)
+        avg = (double) candCount;
+      if(avg < 1.0)
+        avg = 1.0;
+      estimatedNodes *= avg;
+      if(estimatedNodes > 1e18)
+        break;
+    }
+  }
+  if(rate > 0.0 && estimatedNodes > 0.0)
+    etaSeconds = estimatedNodes / rate;
+
+  format_duration(elapsed, elapsedBuf, sizeof(elapsedBuf));
+  if(etaSeconds >= 0.0)
+    format_duration(etaSeconds, etaBuf, sizeof(etaBuf));
+  else
+    snprintf(etaBuf, sizeof(etaBuf), "unknown");
+
+  printf("Progress: depth=%d/%d remaining=%d nodes=%" PRIu64 " rate=%.2f/s elapsed=%s ETA~%s\n",
+         depth, limit, remaining, nodesVisited, rate, elapsedBuf, etaBuf);
+  fflush(stdout);
+}
 
 static uint64_t choose_u64(int n, int r)
 {
@@ -379,6 +451,10 @@ static int search(int depth, int lastBlockIndex)
   int remaining = count_uncovered(uncovered);
   int i;
 
+  nodesVisited++;
+  if(depthNodes)
+    depthNodes[depth]++;
+
   if(remaining == 0) {
     foundDepth = depth;
     return 1;
@@ -404,6 +480,9 @@ static int search(int depth, int lastBlockIndex)
       free(candidates);
       return 0;
     }
+    if(depthCandidates)
+      depthCandidates[depth] += (uint64_t) candCount;
+    report_progress(depth, remaining, candCount);
     for(i = 0; i < candCount; i++) {
       candidates[i].gain = count_block_gain(blocks[candidates[i].index], uncovered);
     }
@@ -534,7 +613,9 @@ int main(int argc, char **argv)
 
   solution = (int *) malloc(sizeof(int) * limit);
   stamp = (int *) calloc(blockCount, sizeof(int));
-  if(!solution || !stamp) {
+  depthNodes = (uint64_t *) calloc(limit + 1, sizeof(uint64_t));
+  depthCandidates = (uint64_t *) calloc(limit + 1, sizeof(uint64_t));
+  if(!solution || !stamp || !depthNodes || !depthCandidates) {
     fprintf(stderr, "ERROR: out of memory for solution/stamp\n");
     return 1;
   }
@@ -553,6 +634,12 @@ int main(int argc, char **argv)
     apply_block(firstMask, uncoveredStack[1]);
     depth = 1;
   }
+
+  startTime = time(NULL);
+  lastReport = 0;
+  printf("Starting exact cover search: v=%d k=%d m=%d t=%d b=%d blocks=%d draws=%d\n",
+         v, k, m, t, limit, blockCount, drawCount);
+  fflush(stdout);
 
   if(search(depth, depth ? solution[depth - 1] : -1)) {
     printf("Found solution with %d blocks. Writing to %s\n", foundDepth, resultFileName);

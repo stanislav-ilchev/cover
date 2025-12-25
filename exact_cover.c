@@ -70,7 +70,7 @@ static char resultFileName[256] = "exact_solution.txt";
 static char satCnfFileName[256] = "exact_cover.cnf";
 static char satSolverCmd[512] = "";
 static int satNoLimit = 0;
-static size_t satMaxAux = 5000000;
+static size_t satMaxAux = 30000000;
 
 static mask_t *blocks = NULL;
 static mask_t *draws = NULL;
@@ -1280,7 +1280,7 @@ static void usage(const char *prog)
 {
   fprintf(stderr,
           "Usage: %s [v=27 k=6 m=4 t=3 b=86 fixFirst=1 threads=1 algo=dfs result=exact_solution.txt "
-          "sat_cnf=exact_cover.cnf sat_solver=CMD sat_no_limit=0 sat_max_aux=5000000]\n",
+          "sat_cnf=exact_cover.cnf sat_solver=CMD sat_no_limit=0 sat_max_aux=30000000]\n",
           prog);
 }
 

@@ -801,19 +801,12 @@ static int sat_solve(void)
             auxCount, satMaxAux);
     applyLimit = 0;
     auxCount = 0;
-  if(!satNoLimit && limit < blockCount)
-    auxCount = sat_aux_count(blockCount, limit);
-  if(auxCount > satMaxAux) {
-    fprintf(stderr, "ERROR: SAT auxiliary variable count %zu exceeds sat_max_aux=%zu\n",
-            auxCount, satMaxAux);
-    return -1;
   }
 
   clauseCount = (size_t) drawCount;
   if(fixedBlockIndex >= 0)
     clauseCount += 1;
   if(applyLimit && limit < blockCount)
-  if(!satNoLimit && limit < blockCount)
     atMostClauses = sat_at_most_clause_count(blockCount, limit);
   clauseCount += (size_t) atMostClauses;
 
@@ -833,7 +826,6 @@ static int sat_solve(void)
   }
 
   if(applyLimit && limit < blockCount)
-  if(!satNoLimit && limit < blockCount)
     sat_emit_at_most(fp, blockCount, limit, 1);
 
   fclose(fp);
@@ -860,7 +852,6 @@ static int sat_solve(void)
     for(i = 1; i <= blockCount; i++) {
       if(model[i] > 0) {
         if(count < limit || !applyLimit)
-        if(count < limit || satNoLimit)
           bestSolution[count++] = i - 1;
       }
     }

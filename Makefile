@@ -21,6 +21,11 @@ cover:	$(OBJECTS)
 	$(CC) -o cover $(OBJECTS) \
 	$(LIBS)
 
+cover_exact: exact_cover.o
+	rm -f cover_exact
+	$(CC) -o cover_exact exact_cover.o \
+	$(LIBS)
+
 distrib:
 	tar cvf cover.tar anneal.c arg.c bincoef.c cover.c exp.c setoper.c solcheck.c tables.c anneal.h arg.h bincoef.h cover.h exp.h setoper.h solcheck.h tables.h Makefile README
 	compress cover.tar
@@ -28,7 +33,7 @@ distrib:
 	echo "NOTE: distribution contains files cover.tar.Z, cover.zip, and README."
 
 clean:
-	rm -f $(OBJECTS)
+	rm -f $(OBJECTS) exact_cover.o
 	rm -f $(AUTOBACKUPS)
 	rm -f core
 	rm -f cover.tar

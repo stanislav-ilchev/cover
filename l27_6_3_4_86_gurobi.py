@@ -3,7 +3,7 @@ import argparse
 import itertools
 from pathlib import Path
 
-from gurobipy import GRB, Model, quicksum
+from gurobipy import GRB, Model, quicksum, read
 
 V = 27
 K = 6
@@ -89,13 +89,18 @@ def main():
     ap = argparse.ArgumentParser(description="Gurobi MIP encoding for L(27,6,4,3)=86")
     ap.add_argument("--solve", action="store_true", help="Solve the model")
     ap.add_argument("--lp", type=Path, help="Write LP file to this path")
+    ap.add_argument("--read-lp", type=Path, help="Read an LP file instead of building the model")
     ap.add_argument("--sol", type=Path, help="Write block solution to this path")
     ap.add_argument("--threads", type=int, default=None, help="Gurobi threads")
     ap.add_argument("--time-limit", type=float, default=None, help="Time limit in seconds")
     ap.add_argument("--seed", type=int, default=None, help="Random seed")
     args = ap.parse_args()
 
-    model, x = build_model()
+    if args.read_lp:
+        model = read(str(args.read_lp))
+        x = None
+    else:
+        model, x = build_model()
 
     if args.threads is not None:
         model.setParam(GRB.Param.Threads, args.threads)
@@ -118,6 +123,9 @@ def main():
         return
 
     print(f"[result] solution status={model.Status}")
+    if x is None:
+        return
+
     blocks = extract_blocks(x)
     if args.sol:
         with args.sol.open("w", encoding="utf-8") as f:

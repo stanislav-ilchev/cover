@@ -3,15 +3,7 @@ import argparse
 import itertools
 from pathlib import Path
 
-try:
-    from gurobipy import GRB, Model, quicksum
-except ModuleNotFoundError as exc:
-    message = (
-        "gurobipy is not installed. Install Gurobi's Python package and ensure "
-        "your license is configured before running this script."
-    )
-    print(message)
-    raise SystemExit(message) from exc
+from gurobipy import GRB, Model, quicksum
 
 V = 27
 K = 6

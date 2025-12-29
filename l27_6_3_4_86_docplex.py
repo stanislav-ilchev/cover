@@ -147,7 +147,7 @@ def build_model(max_blocks, use_mip_start):
 
     if use_mip_start:
         incumbent_set = set(tuple(sorted(block)) for block in INCUMBENT_BLOCKS)
-        start_vals = {x[block]: 1 for block in incumbent_set}
+        start_vals = {x[block]: (1 if block in incumbent_set else 0) for block in all_blocks}
         mdl.add_mip_start(start_vals)
 
     return mdl

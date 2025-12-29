@@ -3,7 +3,14 @@ import argparse
 from collections import Counter, defaultdict
 from itertools import combinations
 
-from docplex.mp.model import Model
+try:
+    from docplex.mp.model import Model
+except ModuleNotFoundError as exc:
+    raise SystemExit(
+        "Missing dependency: docplex.\n"
+        "Install it with:\n"
+        "  python -m pip install docplex\n"
+    ) from exc
 
 V = 27
 K = 6
